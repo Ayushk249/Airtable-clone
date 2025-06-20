@@ -1,4 +1,3 @@
-import { get } from "http";
 import { z } from "zod";
 
 import {
@@ -7,20 +6,16 @@ import {
   publicProcedure,
 } from "~/server/api/trpc";
 
-
 export const baseRouter = createTRPCRouter({
-
- 
   getAllBasesByUser: protectedProcedure.query(async ({ ctx }) => {
     const userId = ctx.session.user.id;
 
     return await ctx.db.base.findMany({
-      where: { userId : userId },
+      where: { userId: userId },
       orderBy: { createdAt: "desc" },
     });
   }),
 
- 
   createBase: protectedProcedure
     .input(z.object({ name: z.string().min(1).max(100) }))
     .mutation(async ({ ctx, input }) => {
@@ -29,7 +24,7 @@ export const baseRouter = createTRPCRouter({
       return await ctx.db.base.create({
         data: {
           title: input.name,
-          userId :  userId,
+          userId: userId,
         },
       });
     }),
@@ -37,11 +32,10 @@ export const baseRouter = createTRPCRouter({
   getById: protectedProcedure
     .input(z.object({ id: z.string() }))
     .query(async ({ ctx, input }) => {
-    return ctx.db.base.findUnique({
-      where: { id: input.id },
-    });
-  }),
-
+      return ctx.db.base.findUnique({
+        where: { id: input.id },
+      });
+    }),
 
   deleteBase: protectedProcedure
     .input(z.object({ baseId: z.string() }))

@@ -1,6 +1,6 @@
+// server/api/routers/table.ts
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-
 import {
   createTRPCRouter,
   protectedProcedure,
@@ -77,15 +77,22 @@ export const tableRouter = createTRPCRouter({
     }),
 });
 
-// Column Procedures
+// Column Procedures - Optimized
 export const columnRouter = createTRPCRouter({
   getByTableId: protectedProcedure
     .input(z.object({ tableId: z.string() }))
     .query(async ({ ctx, input }) => {
-      // Verify the user owns the table
+      // Optimized ownership check - only select what we need
       const table = await ctx.db.table.findFirst({
         where: { id: input.tableId },
-        include: { base: true },
+        select: {
+          id: true,
+          base: {
+            select: {
+              userId: true
+            }
+          }
+        },
       });
 
       if (!table || table.base.userId !== ctx.session.user.id) {
@@ -105,47 +112,59 @@ export const columnRouter = createTRPCRouter({
       tableId: z.string(),
     }))
     .mutation(async ({ ctx, input }) => {
-      // Verify the user owns the table
-      const table = await ctx.db.table.findFirst({
-        where: { id: input.tableId },
-        include: { base: true },
-      });
-
-      if (!table || table.base.userId !== ctx.session.user.id) {
-        throw new TRPCError({ code: "FORBIDDEN" });
-      }
-
-      // Get the next position
-      const lastColumn = await ctx.db.column.findFirst({
-        where: { tableId: input.tableId },
-        orderBy: { position: "desc" },
-      });
-
-      const newColumn = await ctx.db.column.create({
-        data: {
-          name: input.name,
-          type: (input.type ?? "TEXT"),
-          tableId: input.tableId,
-          position: (lastColumn?.position ?? -1) + 1,
-        },
-      });
-
-      // Create cells for this new column in all existing rows
-      const existingRows = await ctx.db.row.findMany({
-        where: { tableId: input.tableId },
-      });
-
-      if (existingRows.length > 0) {
-        await ctx.db.cell.createMany({
-          data: existingRows.map(row => ({
-            rowId: row.id,
-            columnId: newColumn.id,
-            value: "",
-          })),
+      // Use transaction for atomic operations
+      return await ctx.db.$transaction(async (tx) => {
+        // Verify ownership with optimized query
+        const table = await tx.table.findFirst({
+          where: { id: input.tableId },
+          select: {
+            id: true,
+            base: {
+              select: {
+                userId: true
+              }
+            }
+          },
         });
-      }
 
-      return newColumn;
+        if (!table || table.base.userId !== ctx.session.user.id) {
+          throw new TRPCError({ code: "FORBIDDEN" });
+        }
+
+        // Get the next position
+        const lastColumn = await tx.column.findFirst({
+          where: { tableId: input.tableId },
+          select: { position: true },
+          orderBy: { position: "desc" },
+        });
+
+        const newColumn = await tx.column.create({
+          data: {
+            name: input.name,
+            type: (input.type ?? "TEXT"),
+            tableId: input.tableId,
+            position: (lastColumn?.position ?? -1) + 1,
+          },
+        });
+
+        // Create cells for this new column in all existing rows
+        const existingRows = await tx.row.findMany({
+          where: { tableId: input.tableId },
+          select: { id: true }, // Only select what we need
+        });
+
+        if (existingRows.length > 0) {
+          await tx.cell.createMany({
+            data: existingRows.map(row => ({
+              rowId: row.id,
+              columnId: newColumn.id,
+              value: "",
+            })),
+          });
+        }
+
+        return newColumn;
+      });
     }),
 
   delete: protectedProcedure
@@ -154,7 +173,18 @@ export const columnRouter = createTRPCRouter({
       // Verify ownership
       const column = await ctx.db.column.findFirst({
         where: { id: input.id },
-        include: { table: { include: { base: true } } },
+        select: {
+          id: true,
+          table: {
+            select: {
+              base: {
+                select: {
+                  userId: true
+                }
+              }
+            }
+          }
+        },
       });
 
       if (!column || column.table.base.userId !== ctx.session.user.id) {
@@ -168,15 +198,22 @@ export const columnRouter = createTRPCRouter({
     }),
 });
 
-// Row Procedures
+// Row Procedures - Optimized
 export const rowRouter = createTRPCRouter({
   getByTableId: protectedProcedure
     .input(z.object({ tableId: z.string() }))
     .query(async ({ ctx, input }) => {
-      // Verify the user owns the table
+      // Verify ownership
       const table = await ctx.db.table.findFirst({
         where: { id: input.tableId },
-        include: { base: true },
+        select: {
+          id: true,
+          base: {
+            select: {
+              userId: true
+            }
+          }
+        },
       });
 
       if (!table || table.base.userId !== ctx.session.user.id) {
@@ -201,56 +238,67 @@ export const rowRouter = createTRPCRouter({
       tableId: z.string(),
     }))
     .mutation(async ({ ctx, input }) => {
-      // Verify the user owns the table
-      const table = await ctx.db.table.findFirst({
-        where: { id: input.tableId },
-        include: { base: true },
-      });
-
-      if (!table || table.base.userId !== ctx.session.user.id) {
-        throw new TRPCError({ code: "FORBIDDEN" });
-      }
-
-      // Get the next position
-      const lastRow = await ctx.db.row.findFirst({
-        where: { tableId: input.tableId },
-        orderBy: { position: "desc" },
-      });
-
-      // Create the row
-      const newRow = await ctx.db.row.create({
-        data: {
-          tableId: input.tableId,
-          position: (lastRow?.position ?? -1) + 1,
-        },
-      });
-
-      // Get all columns for this table
-      const columns = await ctx.db.column.findMany({
-        where: { tableId: input.tableId },
-      });
-
-      // Create cells for each column
-      if (columns.length > 0) {
-        await ctx.db.cell.createMany({
-          data: columns.map(column => ({
-            rowId: newRow.id,
-            columnId: column.id,
-            value: "",
-          })),
+      return await ctx.db.$transaction(async (tx) => {
+        // Verify ownership
+        const table = await tx.table.findFirst({
+          where: { id: input.tableId },
+          select: {
+            id: true,
+            base: {
+              select: {
+                userId: true
+              }
+            }
+          },
         });
-      }
 
-      // Return the row with cells
-      return ctx.db.row.findFirst({
-        where: { id: newRow.id },
-        include: {
-          cells: {
-            include: {
-              column: true,
+        if (!table || table.base.userId !== ctx.session.user.id) {
+          throw new TRPCError({ code: "FORBIDDEN" });
+        }
+
+        // Get the next position
+        const lastRow = await tx.row.findFirst({
+          where: { tableId: input.tableId },
+          select: { position: true },
+          orderBy: { position: "desc" },
+        });
+
+        // Create the row
+        const newRow = await tx.row.create({
+          data: {
+            tableId: input.tableId,
+            position: (lastRow?.position ?? -1) + 1,
+          },
+        });
+
+        // Get all columns for this table
+        const columns = await tx.column.findMany({
+          where: { tableId: input.tableId },
+          select: { id: true },
+        });
+
+        // Create cells for each column
+        if (columns.length > 0) {
+          await tx.cell.createMany({
+            data: columns.map(column => ({
+              rowId: newRow.id,
+              columnId: column.id,
+              value: "",
+            })),
+          });
+        }
+
+        // Return the row with cells
+        return tx.row.findFirst({
+          where: { id: newRow.id },
+          include: {
+            cells: {
+              include: {
+                column: true,
+              },
             },
           },
-        },
+        });
       });
     }),
 
@@ -260,7 +308,18 @@ export const rowRouter = createTRPCRouter({
       // Verify ownership
       const row = await ctx.db.row.findFirst({
         where: { id: input.id },
-        include: { table: { include: { base: true } } },
+        select: {
+          id: true,
+          table: {
+            select: {
+              base: {
+                select: {
+                  userId: true
+                }
+              }
+            }
+          }
+        },
       });
 
       if (!row || row.table.base.userId !== ctx.session.user.id) {
@@ -274,7 +333,7 @@ export const rowRouter = createTRPCRouter({
     }),
 });
 
-// Cell Procedures
+// Cell Procedures - Optimized
 export const cellRouter = createTRPCRouter({
   update: protectedProcedure
     .input(z.object({
@@ -286,7 +345,18 @@ export const cellRouter = createTRPCRouter({
       // Verify ownership through the row
       const row = await ctx.db.row.findFirst({
         where: { id: input.rowId },
-        include: { table: { include: { base: true } } },
+        select: {
+          id: true,
+          table: {
+            select: {
+              base: {
+                select: {
+                  userId: true
+                }
+              }
+            }
+          }
+        },
       });
 
       if (!row || row.table.base.userId !== ctx.session.user.id) {
@@ -303,6 +373,7 @@ export const cellRouter = createTRPCRouter({
         },
         update: {
           value: input.value,
+          updatedAt: new Date(),
         },
         create: {
           rowId: input.rowId,
