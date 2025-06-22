@@ -38,6 +38,7 @@ export default async function TablePage({ params }: PageProps) {
           initialColumns={initialColumns}
           tableName={table.name}
           baseName={base.title}
+          baseId={base.id}
         />
       </div>
     </div>

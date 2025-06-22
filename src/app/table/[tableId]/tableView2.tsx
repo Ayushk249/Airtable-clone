@@ -1,7 +1,8 @@
-// app/table/[tableId]/TableView2.tsx
+// app/table/[tableId]/tableView.tsx
 "use client";
 
 import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
@@ -10,7 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/components/ui/select";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "~/components/ui/dropdown-menu";
 import { api } from "~/trpc/react";
-import { Plus, ChevronDown, Grid3X3, EyeOff, ArrowUpDown, List, Loader2 } from "lucide-react";
+import { Plus, ChevronDown, Grid3X3, EyeOff, ArrowUpDown, List, Loader2, Search, X } from "lucide-react";
 
 // Import types that match your Prisma schema
 import type { Column, Row, Cell, ColumnType, RowWithCells } from "./interface";
@@ -21,13 +22,23 @@ interface TableViewProps {
   initialColumns: Column[];
   tableName: string;
   baseName: string;
+  baseId: string;
 }
 
-export function TableView({ tableId, initialData, initialColumns, tableName, baseName }: TableViewProps) {
+export function TableView({ tableId, initialData, initialColumns, tableName, baseName, baseId }: TableViewProps) {
+  const router = useRouter();
   const [newColumnName, setNewColumnName] = useState("");
   const [newColumnType, setNewColumnType] = useState<"TEXT" | "NUMBER">("TEXT");
   const [showCreateFieldModal, setShowCreateFieldModal] = useState(false);
   const [editingCell, setEditingCell] = useState<{rowId: string, columnId: string} | null>(null);
+  
+  // Table tab management states
+  const [showCreateTableModal, setShowCreateTableModal] = useState(false);
+  const [newTableName, setNewTableName] = useState("");
+  const [isLoadingTable, setIsLoadingTable] = useState(false);
+  
+  // Search functionality
+  const [searchQuery, setSearchQuery] = useState("");
   
   // Track temporary cell values for rows that haven't been saved yet
   const [tempCellValues, setTempCellValues] = useState<Record<string, Record<string, string>>>({});
@@ -49,6 +60,19 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   const COLUMN_WIDTH = 200;
   const ROW_HEIGHT = 48;
 
+  const utils = api.useUtils();
+
+  // Fetch all tables in this base for the tab navigation
+  const { data: allTables = [], isLoading: isTablesLoading } = api.table.getAllByBase.useQuery(
+    { baseId },
+    {
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+      staleTime: 5 * 60 * 1000,
+    }
+  );
+
   // Synchronize horizontal scrolling between header and data
   const syncScroll = useCallback((source: 'header' | 'data', scrollLeft: number) => {
     if (source === 'data' && headerScrollRef.current) {
@@ -58,12 +82,88 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
     }
   }, []);
 
+  // Create table mutation
+  const createTableMutation = api.table.create.useMutation({
+    onMutate: async (variables) => {
+      await utils.table.getAllByBase.cancel({ baseId });
+      const previousTables = utils.table.getAllByBase.getData({ baseId });
+      
+      const optimisticTable = {
+        id: `temp-table-${Date.now()}`,
+        name: variables.name,
+        baseId: variables.baseId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      
+      utils.table.getAllByBase.setData({ baseId }, (old) => {
+        return [...(old ?? []), optimisticTable];
+      });
+      
+      setNewTableName("");
+      setShowCreateTableModal(false);
+      
+      return { previousTables, tempTableId: optimisticTable.id };
+    },
+    onSuccess: (realTable, variables, context) => {
+      utils.table.getAllByBase.setData({ baseId }, (oldTables) => {
+        if (!oldTables) return [realTable];
+        return oldTables.map(table => 
+          table.id === context?.tempTableId ? realTable : table
+        );
+      });
+      router.push(`/table/${realTable.id}`);
+    },
+    onError: (error, variables, context) => {
+      if (context?.previousTables) {
+        utils.table.getAllByBase.setData({ baseId }, context.previousTables);
+      }
+      setNewTableName("");
+      setShowCreateTableModal(false);
+      console.error('Failed to create table:', error);
+    },
+  });
+
+  // Handle table switching with loading state
+  const handleTableSwitch = async (newTableId: string) => {
+    if (newTableId === tableId) return;
+    setIsLoadingTable(true);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    router.push(`/table/${newTableId}`);
+  };
+
+  const handleCreateTable = () => {
+    if (newTableName.trim()) {
+      createTableMutation.mutate({
+        name: newTableName.trim(),
+        baseId,
+      });
+    }
+  };
+
+  // Function to highlight search terms in text
+  const highlightSearchTerm = (text: string, searchTerm: string) => {
+    if (!searchTerm.trim() || !text) return text;
+    
+    const regex = new RegExp(`(${searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    const parts = text.split(regex);
+    
+    return parts.map((part, index) => 
+      regex.test(part) ? (
+        <mark key={index} className="bg-yellow-200 text-black">
+          {part}
+        </mark>
+      ) : (
+        part
+      )
+    );
+  };
+
   // Auto-finalize temp rows after inactivity
   useEffect(() => {
     const autoFinalize = setInterval(() => {
       const now = Date.now();
       
-      // Auto-finalize temp rows that have been inactive for 30 seconds
       if (now - lastLocalChange > 30000) {
         setTempToRealMapping(currentMapping => {
           const mappingEntries = Object.entries(currentMapping);
@@ -73,7 +173,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
           let hasChanges = false;
           
           mappingEntries.forEach(([tempRowId, realRowId]) => {
-            // This temp row has a real backing, can auto-finalize
             setTempCellValues(prev => {
               const { [tempRowId]: removed, ...rest } = prev;
               return rest;
@@ -86,7 +185,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
         });
       }
       
-      // Clean up old pending changes
       setPendingChanges(prev => {
         const cleaned = { ...prev };
         let hasChanges = false;
@@ -107,12 +205,10 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
         
         return hasChanges ? cleaned : prev;
       });
-    }, 15000); // Check every 15 seconds
+    }, 15000);
     
     return () => clearInterval(autoFinalize);
   }, [lastLocalChange]);
-
-  const utils = api.useUtils();
 
   // Get the columns data
   const { data: columns = [] } = api.column.getByTableId.useQuery(
@@ -138,7 +234,7 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   } = api.row.getByTableIdInfinite.useInfiniteQuery(
     { 
       tableId,
-      limit: 50, // Load 50 rows at a time
+      limit: 50,
     },
     {
       getNextPageParam: (lastPage) => lastPage.nextCursor,
@@ -147,7 +243,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
       refetchOnReconnect: false,
       staleTime: 5 * 60 * 1000,
       gcTime: 10 * 60 * 1000,
-      // Convert initial data to infinite query format
       ...(initialData.length > 0 && {
         initialData: {
           pages: [{ items: initialData, nextCursor: undefined }],
@@ -167,28 +262,22 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   const smartDataSelect = useCallback((serverData: RowWithCells[]) => {
     if (!serverData) return [];
     
-    // Start with server data, but filter out rows that have temp equivalents still active
     const filteredServerData = serverData.filter(row => {
-      // Check if this real row has a temp equivalent that's still active
       const tempRowId = Object.keys(tempToRealMapping).find(tempId => tempToRealMapping[tempId] === row.id);
       if (tempRowId && tempCellValues[tempRowId]) {
-        // If temp row still has values, keep the temp row instead of this real row
         return false;
       }
       return true;
     });
     
-    // Add temp rows to the data
     const tempRows: RowWithCells[] = Object.keys(tempCellValues).map(tempRowId => {
-      // If this temp row is mapped to a real row, use the real row structure
       const realRowId = tempToRealMapping[tempRowId];
       if (realRowId) {
         const realRow = serverData.find(r => r.id === realRowId);
         if (realRow) {
-          // Use real row structure but with temp values
           return {
             ...realRow,
-            id: tempRowId, // Keep temp ID for UI consistency
+            id: tempRowId,
             cells: realRow.cells.map(cell => ({
               ...cell,
               id: `temp-cell-${tempRowId}-${cell.columnId}`,
@@ -199,11 +288,10 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
         }
       }
       
-      // Fallback: create temp row structure
       return {
         id: tempRowId,
         tableId,
-        position: 999, // Put temp rows at the end
+        position: 999,
         createdAt: new Date(),
         updatedAt: new Date(),
         cells: columns.map(col => ({
@@ -218,7 +306,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
       };
     });
     
-    // Merge server data with pending changes
     const mergedServerData = filteredServerData.map(row => {
       const rowPendingChanges = pendingChanges[row.id];
       if (!rowPendingChanges) {
@@ -240,28 +327,32 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
       };
     });
     
-    // Combine and sort
     return [...mergedServerData, ...tempRows].sort((a, b) => a.position - b.position);
   }, [pendingChanges, tempCellValues, tempToRealMapping, tableId, columns]);
 
   // Apply smart selection to protect local changes
   const tableData = useMemo(() => smartDataSelect(allRows), [allRows, smartDataSelect]);
 
-  // Debug: Log data info
-  console.log('TableView Debug:', {
-    allRowsLength: allRows.length,
-    tableDataLength: tableData.length,
-    columnsLength: columns.length,
-    hasNextPage,
-    isFetchingNextPage,
-    pagesLoaded: infiniteRowData?.pages.length || 0,
-    tempCellValuesKeys: Object.keys(tempCellValues),
-    tempToRealMappingKeys: Object.keys(tempToRealMapping)
-  });
+  // Filter data based on search query
+  const filteredTableData = useMemo(() => {
+    if (!searchQuery.trim()) {
+      return tableData;
+    }
+
+    const query = searchQuery.toLowerCase().trim();
+    
+    return tableData.filter(row => {
+      // Search across all cells in the row
+      return row.cells.some(cell => {
+        const cellValue = cell.value?.toLowerCase() || "";
+        return cellValue.includes(query);
+      });
+    });
+  }, [tableData, searchQuery]);
 
   // Setup row virtualizer with infinite scroll support
   const rowVirtualizer = useVirtualizer({
-    count: hasNextPage ? tableData.length + 1 : tableData.length + 1, // +1 for add row button, +1 for loading row if hasNextPage
+    count: hasNextPage ? filteredTableData.length + 1 : filteredTableData.length + 1,
     getScrollElement: () => tableContainerRef.current,
     estimateSize: () => ROW_HEIGHT,
     overscan: 10,
@@ -273,18 +364,11 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
 
     if (!lastItem) return;
 
-    // Trigger fetch when we're near the end (within 5 rows of the bottom)
     if (
-      lastItem.index >= tableData.length - 5 &&
+      lastItem.index >= filteredTableData.length - 5 &&
       hasNextPage &&
       !isFetchingNextPage
     ) {
-      console.log('🔄 Fetching next page...', {
-        lastIndex: lastItem.index,
-        dataLength: tableData.length,
-        hasNextPage,
-        isFetchingNextPage
-      });
       void fetchNextPage();
     }
   }, [
@@ -292,7 +376,7 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
     fetchNextPage,
     isFetchingNextPage,
     rowVirtualizer.getVirtualItems(),
-    tableData.length,
+    filteredTableData.length,
   ]);
 
   // Enhanced column creation
@@ -608,30 +692,102 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   // Check if any mutations are pending for loading state
   const isLoading = createColumnMutation.isPending || createRowMutation.isPending;
 
+  // Show loading screen when switching tables
+  if (isLoadingTable) {
+    return (
+      <div className="h-full bg-white flex flex-col overflow-hidden">
+        <div className="bg-purple-600 text-white flex-shrink-0">
+          <div className="flex items-center px-0">
+            <div className="flex items-center">
+              {isTablesLoading ? (
+                <div className="bg-purple-700 px-4 py-3 text-sm font-medium border-r border-purple-500 flex items-center">
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Loading tables...
+                </div>
+              ) : (
+                allTables.map((table) => (
+                  <div
+                    key={table.id}
+                    className={`px-4 py-3 text-sm font-medium cursor-pointer border-r border-purple-500 transition-colors ${
+                      table.id === tableId
+                        ? "bg-purple-700"
+                        : "text-purple-100 hover:bg-purple-700"
+                    }`}
+                    onClick={() => !isLoadingTable && handleTableSwitch(table.id)}
+                  >
+                    {table.name}
+                  </div>
+                ))
+              )}
+              
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-purple-100 hover:bg-purple-700 px-3 py-3 rounded-none h-auto"
+                onClick={() => setShowCreateTableModal(true)}
+                disabled={createTableMutation.isPending}
+              >
+                {createTableMutation.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Plus className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex-1 bg-white flex items-center justify-center">
+          <div className="text-center">
+            <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4 text-purple-600" />
+            <p className="text-gray-600 text-lg font-medium">Loading table...</p>
+          
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-full bg-white flex flex-col overflow-hidden">
       {/* Header with Tabs - Fixed */}
       <div className="bg-purple-600 text-white flex-shrink-0">
         <div className="flex items-center px-0">
           <div className="flex items-center">
-            <div className="flex items-center">
-              <div className="bg-purple-700 px-4 py-3 text-sm font-medium border-r border-purple-500">
-                {tableName}
+            {isTablesLoading ? (
+              <div className="bg-purple-700 px-4 py-3 text-sm font-medium border-r border-purple-500 flex items-center">
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                Loading tables...
               </div>
-              <div className="px-4 py-3 text-sm text-purple-100 hover:bg-purple-700 cursor-pointer border-r border-purple-500">
-                Table 2
-              </div>
-              <div className="px-4 py-3 text-sm text-purple-100 hover:bg-purple-700 cursor-pointer border-r border-purple-500">
-                Table 3
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-purple-100 hover:bg-purple-700 px-3 py-3 rounded-none h-auto"
-              >
+            ) : (
+              allTables.map((table) => (
+                <div
+                  key={table.id}
+                  className={`px-4 py-3 text-sm font-medium cursor-pointer border-r border-purple-500 transition-colors ${
+                    table.id === tableId
+                      ? "bg-purple-700"
+                      : "text-purple-100 hover:bg-purple-700"
+                  }`}
+                  onClick={() => handleTableSwitch(table.id)}
+                >
+                  {table.name}
+                </div>
+              ))
+            )}
+            
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-purple-100 hover:bg-purple-700 px-3 py-3 rounded-none h-auto"
+              onClick={() => setShowCreateTableModal(true)}
+              disabled={createTableMutation.isPending}
+            >
+              {createTableMutation.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
                 <Plus className="h-4 w-4" />
-              </Button>
-            </div>
+              )}
+            </Button>
           </div>
         </div>
       </div>
@@ -675,7 +831,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
               Sort
             </Button>
 
-            {/* Loading indicator */}
             {isLoading && (
               <div className="flex items-center space-x-2 text-gray-600 px-2">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -685,17 +840,41 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
               </div>
             )}
           </div>
+
+          {/* Search component on the right */}
+          <div className="flex items-center space-x-2">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 h-4 w-4" />
+              <Input
+                placeholder="Search all columns..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-10 pr-8 w-64 h-8"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+            {searchQuery && (
+              <div className="text-sm text-gray-500 bg-gray-100 px-2 py-1 rounded">
+                {filteredTableData.length} of {tableData.length} rows
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
       {/* Fixed Column Headers */}
       <div className="border-b bg-gray-50 flex flex-shrink-0">
-        {/* Row Number Header */}
         <div className="w-16 px-4 py-3 text-center font-medium text-gray-900 border-r bg-gray-50 flex-shrink-0">
           #
         </div>
         
-        {/* Data Column Headers - Synced horizontal scroll */}
         <div 
           ref={headerScrollRef}
           className="flex-1 overflow-x-auto overflow-y-hidden [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
@@ -719,7 +898,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
           </div>
         </div>
         
-        {/* Add Column Header */}
         <div className="w-16 flex items-center justify-center border-r bg-gray-50 flex-shrink-0">
           <Button
             variant="ghost"
@@ -732,9 +910,8 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
         </div>
       </div>
 
-      {/* Scrollable Table Body - This is the ONLY scrollable area */}
+      {/* Scrollable Table Body */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
-        {/* Initial Loading State */}
         {isRowsLoading && !infiniteRowData ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center">
@@ -750,7 +927,6 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
             </div>
           </div>
         ) : (
-          /* MAIN Scrollable Data Area - ONLY this scrolls and is contained */
           <div 
             ref={tableContainerRef}
             className="flex-1 overflow-auto min-h-0"
@@ -761,21 +937,63 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
             <div
               style={{
                 height: `${rowVirtualizer.getTotalSize()}px`,
-                width: `${(columns.length * COLUMN_WIDTH) + 16}px`, // +16 for row numbers
+                width: `${(columns.length * COLUMN_WIDTH) + 16}px`,
                 position: 'relative',
               }}
             >
-              {/* Virtualized Rows */}
-              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                const isAddRowButton = virtualRow.index === tableData.length;
-                const isLoadingRow = virtualRow.index > tableData.length; // Loading indicator row
-                const row = tableData[virtualRow.index];
+              {/* Show "No results" when search returns empty */}
+              {searchQuery && filteredTableData.length === 0 ? (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="text-center">
+                    <Search className="h-8 w-8 mx-auto mb-2 text-gray-400" />
+                    <p className="text-gray-600 font-medium">No results found</p>
+                    <p className="text-gray-500 text-sm">
+                      Try adjusting your search to find what you're looking for.
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setSearchQuery("")}
+                      className="mt-2"
+                    >
+                      Clear search
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                /* Virtualized Rows */
+                rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                  const isAddRowButton = virtualRow.index === filteredTableData.length;
+                  const isLoadingRow = virtualRow.index > filteredTableData.length;
+                  const row = filteredTableData[virtualRow.index];
 
-                // Loading row for infinite scroll
-                if (isLoadingRow && hasNextPage) {
+                  if (isLoadingRow && hasNextPage) {
+                    return (
+                      <div
+                        key={`loading-${virtualRow.key}`}
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          left: 0,
+                          width: '100%',
+                          height: `${virtualRow.size}px`,
+                          transform: `translateY(${virtualRow.start}px)`,
+                        }}
+                        className="flex border-b bg-gray-50"
+                      >
+                        <div className="w-16 flex items-center justify-center border-r">
+                          <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+                        </div>
+                        <div className="flex-1 flex items-center justify-center text-gray-500 text-sm">
+                          {isFetchingNextPage ? 'Loading more rows...' : 'Scroll to load more'}
+                        </div>
+                      </div>
+                    );
+                  }
+
                   return (
                     <div
-                      key={`loading-${virtualRow.key}`}
+                      key={virtualRow.key}
                       style={{
                         position: 'absolute',
                         top: 0,
@@ -784,146 +1002,119 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
                         height: `${virtualRow.size}px`,
                         transform: `translateY(${virtualRow.start}px)`,
                       }}
-                      className="flex border-b bg-gray-50"
+                      className="flex border-b hover:bg-gray-50"
                     >
-                      <div className="w-16 flex items-center justify-center border-r">
-                        <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+                      <div 
+                        className="w-16 bg-gray-50 border-r flex-shrink-0 flex items-center justify-center"
+                        style={{ height: `${virtualRow.size}px` }}
+                      >
+                        {isAddRowButton ? (
+                          <Button 
+                            variant="ghost" 
+                            size="sm" 
+                            onClick={handleAddRow} 
+                            className="h-8 w-8 p-0 hover:bg-gray-200 rounded-none"
+                            disabled={createRowMutation.isPending}
+                          >
+                            <Plus className="h-3 w-3" />
+                          </Button>
+                        ) : (
+                          <span className="text-sm text-gray-500">
+                            {virtualRow.index + 1}
+                          </span>
+                        )}
                       </div>
-                      <div className="flex-1 flex items-center justify-center text-gray-500 text-sm">
-                        {isFetchingNextPage ? 'Loading more rows...' : 'Scroll to load more'}
-                      </div>
-                    </div>
-                  );
-                }
 
-                return (
-                  <div
-                    key={virtualRow.key}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      height: `${virtualRow.size}px`,
-                      transform: `translateY(${virtualRow.start}px)`,
-                    }}
-                    className="flex border-b hover:bg-gray-50"
-                  >
-                    {/* Row Number Column - First in the data area */}
-                    <div 
-                      className="w-16 bg-gray-50 border-r flex-shrink-0 flex items-center justify-center"
-                      style={{ height: `${virtualRow.size}px` }}
-                    >
-                      {isAddRowButton ? (
-                        <Button 
-                          variant="ghost" 
-                          size="sm" 
-                          onClick={handleAddRow} 
-                          className="h-8 w-8 p-0 hover:bg-gray-200 rounded-none"
-                          disabled={createRowMutation.isPending}
-                        >
-                          <Plus className="h-3 w-3" />
-                        </Button>
-                      ) : (
-                        <span className="text-sm text-gray-500">
-                          {virtualRow.index + 1}
-                        </span>
-                      )}
-                    </div>
+                      {columns.map((column, columnIndex) => {
+                        let content: React.ReactNode = null;
 
-                    {/* All Data Columns */}
-                    {columns.map((column, columnIndex) => {
-                      let content: React.ReactNode = null;
+                        if (isAddRowButton) {
+                          content = <div className="h-12" />;
+                        } else if (row) {
+                          const isTemporaryRow = row.id.startsWith('temp-row-');
+                          let value = "";
 
-                      if (isAddRowButton) {
-                        // Empty cell for add row
-                        content = <div className="h-12" />;
-                      } else if (row) {
-                        // Regular data cell
-                        const isTemporaryRow = row.id.startsWith('temp-row-');
-                        let value = "";
+                          if (isTemporaryRow) {
+                            value = tempCellValues[row.id]?.[column.id] || "";
+                          } else if (pendingChanges[row.id]?.[column.id]) {
+                            value = pendingChanges[row.id][column.id].value;
+                          } else {
+                            const cell = row.cells.find(c => c.columnId === column.id);
+                            value = cell?.value || "";
+                          }
 
-                        if (isTemporaryRow) {
-                          value = tempCellValues[row.id]?.[column.id] || "";
-                        } else if (pendingChanges[row.id]?.[column.id]) {
-                          value = pendingChanges[row.id][column.id].value;
-                        } else {
-                          const cell = row.cells.find(c => c.columnId === column.id);
-                          value = cell?.value || "";
-                        }
+                          const isEditing = editingCell?.rowId === row.id && editingCell?.columnId === column.id;
+                          const isUpdating = updateCellMutation.isPending && 
+                                            updateCellMutation.variables?.rowId === row.id && 
+                                            updateCellMutation.variables?.columnId === column.id;
 
-                        const isEditing = editingCell?.rowId === row.id && editingCell?.columnId === column.id;
-                        const isUpdating = updateCellMutation.isPending && 
-                                          updateCellMutation.variables?.rowId === row.id && 
-                                          updateCellMutation.variables?.columnId === column.id;
-
-                        if (isEditing) {
-                          content = (
-                            <Input
-                              defaultValue={value}
-                              autoFocus
-                              className="border-none rounded-none focus:ring-0 focus:border-blue-500 px-4 h-12 w-full"
-                              disabled={isUpdating}
-                              onBlur={(e) => {
-                                const newValue = e.target.value;
-                                if (newValue !== value) {
-                                  handleCellUpdate(row.id, column.id, newValue);
-                                } else {
-                                  setEditingCell(null);
-                                }
-                              }}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") {
-                                  const newValue = e.currentTarget.value;
+                          if (isEditing) {
+                            content = (
+                              <Input
+                                defaultValue={value}
+                                autoFocus
+                                className="border-none rounded-none focus:ring-0 focus:border-blue-500 px-4 h-12 w-full"
+                                disabled={isUpdating}
+                                onBlur={(e) => {
+                                  const newValue = e.target.value;
                                   if (newValue !== value) {
                                     handleCellUpdate(row.id, column.id, newValue);
                                   } else {
                                     setEditingCell(null);
                                   }
-                                } else if (e.key === "Escape") {
-                                  setEditingCell(null);
-                                }
-                              }}
-                            />
-                          );
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    const newValue = e.currentTarget.value;
+                                    if (newValue !== value) {
+                                      handleCellUpdate(row.id, column.id, newValue);
+                                    } else {
+                                      setEditingCell(null);
+                                    }
+                                  } else if (e.key === "Escape") {
+                                    setEditingCell(null);
+                                  }
+                                }}
+                              />
+                            );
+                          } else {
+                            content = (
+                              <div 
+                                className="cursor-pointer hover:bg-gray-100 px-4 h-12 flex items-center w-full"
+                                onClick={() => {
+                                  if (!isUpdating) {
+                                    setEditingCell({ rowId: row.id, columnId: column.id });
+                                  }
+                                }}
+                              >
+                                {searchQuery ? highlightSearchTerm(value, searchQuery) : (value || "")}
+                              </div>
+                            );
+                          }
                         } else {
                           content = (
-                            <div 
-                              className="cursor-pointer hover:bg-gray-100 px-4 h-12 flex items-center w-full"
-                              onClick={() => {
-                                if (!isUpdating) {
-                                  setEditingCell({ rowId: row.id, columnId: column.id });
-                                }
-                              }}
-                            >
-                              {value || ""}
+                            <div className="px-4 h-12 flex items-center w-full text-red-500 text-xs">
+                              Missing row {virtualRow.index}
                             </div>
                           );
                         }
-                      } else {
-                        // Missing row data - show debugging info
-                        content = (
-                          <div className="px-4 h-12 flex items-center w-full text-red-500 text-xs">
-                            Missing row {virtualRow.index}
+
+                        return (
+                          <div
+                            key={column.id}
+                            style={{
+                              width: `${COLUMN_WIDTH}px`,
+                            }}
+                            className="border-r flex-shrink-0"
+                          >
+                            {content}
                           </div>
                         );
-                      }
-
-                      return (
-                        <div
-                          key={column.id}
-                          style={{
-                            width: `${COLUMN_WIDTH}px`,
-                          }}
-                          className="border-r flex-shrink-0"
-                        >
-                          {content}
-                        </div>
-                      );
-                    })}
-                  </div>
-                );
-              })}
+                      })}
+                    </div>
+                  );
+                })
+              )}
             </div>
           </div>
         )}
@@ -975,6 +1166,56 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
               disabled={createColumnMutation.isPending}
             >
               {createColumnMutation.isPending ? "Creating..." : "Create field"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Create Table Modal */}
+      <Dialog open={showCreateTableModal} onOpenChange={setShowCreateTableModal}>
+        <DialogContent className="sm:max-w-[400px]">
+          <DialogHeader>
+            <DialogTitle>Create table</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="table-name">Table name</Label>
+              <Input
+                id="table-name"
+                value={newTableName}
+                onChange={(e) => setNewTableName(e.target.value)}
+                placeholder="Enter table name"
+                className="mt-1"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    handleCreateTable();
+                  }
+                }}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button 
+              variant="outline" 
+              onClick={() => {
+                setShowCreateTableModal(false);
+                setNewTableName("");
+              }}
+            >
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleCreateTable}
+              disabled={createTableMutation.isPending || !newTableName.trim()}
+            >
+              {createTableMutation.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Creating...
+                </>
+              ) : (
+                "Create table"
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>
