@@ -170,6 +170,56 @@ export const columnRouter = createTRPCRouter({
 
 // Row Procedures
 export const rowRouter = createTRPCRouter({
+getByTableIdInfinite: protectedProcedure
+  .input(z.object({ 
+    tableId: z.string(),
+    limit: z.number().min(1).max(100).default(50),
+    cursor: z.string().optional(), // cursor is row id for pagination
+  }))
+  .query(async ({ ctx, input }) => {
+    // Verify the user owns the table
+    const table = await ctx.db.table.findFirst({
+      where: { id: input.tableId },
+      include: { base: true },
+    });
+
+    if (!table || table.base.userId !== ctx.session.user.id) {
+      throw new TRPCError({ code: "FORBIDDEN" });
+    }
+
+    const rows = await ctx.db.row.findMany({
+      where: { 
+        tableId: input.tableId,
+        ...(input.cursor ? {
+          id: {
+            gt: input.cursor, // Get rows after the cursor
+          },
+        } : {}),
+      },
+      include: {
+        cells: {
+          include: {
+            column: true,
+          },
+        },
+      },
+      orderBy: { position: "asc" },
+      take: input.limit + 1, // Take one extra to know if there's a next page
+    });
+
+    let nextCursor: string | undefined = undefined;
+    if (rows.length > input.limit) {
+      const nextItem = rows.pop(); // Remove the extra item
+      nextCursor = nextItem!.id;
+    }
+
+    return {
+      items: rows,
+      nextCursor,
+    };
+  }),
+
+  
   getByTableId: protectedProcedure
     .input(z.object({ tableId: z.string() }))
     .query(async ({ ctx, input }) => {

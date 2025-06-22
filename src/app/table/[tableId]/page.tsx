@@ -27,19 +27,19 @@ export default async function TablePage({ params }: PageProps) {
   const initialColumns = await api.column.getByTableId({ tableId: params.tableId });
 
   return (
-    <>
-      <Header />
-      <main className="max-w-7xl mx-auto py-8 px-4">
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold mb-2">{table.name}</h1>
-          <p className="text-gray-600">Base: {base.title}</p>
-        </div>
+    <div className="h-screen flex flex-col overflow-hidden">
+      <div className="flex-shrink-0">
+        <Header />
+      </div>
+      <div className="flex-1 min-h-0 overflow-hidden">
         <TableView 
           tableId={params.tableId}
           initialData={initialData}
           initialColumns={initialColumns}
+          tableName={table.name}
+          baseName={base.title}
         />
-      </main>
-    </>
+      </div>
+    </div>
   );
 }
