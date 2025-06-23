@@ -83,46 +83,74 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   }, []);
 
   // Create table mutation
-  const createTableMutation = api.table.create.useMutation({
-    onMutate: async (variables) => {
-      await utils.table.getAllByBase.cancel({ baseId });
-      const previousTables = utils.table.getAllByBase.getData({ baseId });
+  // Update for your tableView component (inside the createTableMutation)
+// This replaces the existing createTableMutation in your tableView.tsx
+
+const createTableMutation = api.table.create.useMutation({
+  onMutate: async (variables) => {
+    await utils.table.getAllByBase.cancel({ baseId });
+    const previousTables = utils.table.getAllByBase.getData({ baseId });
+    
+    const optimisticTable = {
+      id: `temp-table-${Date.now()}`,
+      name: variables.name,
+      baseId: variables.baseId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    
+    utils.table.getAllByBase.setData({ baseId }, (old) => {
+      return [...(old ?? []), optimisticTable];
+    });
+    
+    setNewTableName("");
+    setShowCreateTableModal(false);
+    
+    return { previousTables, tempTableId: optimisticTable.id };
+  },
+  onSuccess: (realTable, variables, context) => {
+    // Update the tables list
+    utils.table.getAllByBase.setData({ baseId }, (oldTables) => {
+      if (!oldTables) return [realTable];
+      return oldTables.map(table => 
+        table.id === context?.tempTableId ? realTable : table
+      );
+    });
+
+    // Pre-populate the cache with the new table's data
+    // This ensures that when we navigate to the new table, the data is already available
+    if (realTable && 'rows' in realTable && 'columns' in realTable) {
+      // Set the row data
+      utils.row.getByTableId.setData({ tableId: realTable.id }, realTable.rows || []);
       
-      const optimisticTable = {
-        id: `temp-table-${Date.now()}`,
-        name: variables.name,
-        baseId: variables.baseId,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
+      // Set the column data
+      utils.column.getByTableId.setData({ tableId: realTable.id }, realTable.columns || []);
       
-      utils.table.getAllByBase.setData({ baseId }, (old) => {
-        return [...(old ?? []), optimisticTable];
-      });
-      
-      setNewTableName("");
-      setShowCreateTableModal(false);
-      
-      return { previousTables, tempTableId: optimisticTable.id };
-    },
-    onSuccess: (realTable, variables, context) => {
-      utils.table.getAllByBase.setData({ baseId }, (oldTables) => {
-        if (!oldTables) return [realTable];
-        return oldTables.map(table => 
-          table.id === context?.tempTableId ? realTable : table
-        );
-      });
-      router.push(`/table/${realTable.id}`);
-    },
-    onError: (error, variables, context) => {
-      if (context?.previousTables) {
-        utils.table.getAllByBase.setData({ baseId }, context.previousTables);
-      }
-      setNewTableName("");
-      setShowCreateTableModal(false);
-      console.error('Failed to create table:', error);
-    },
-  });
+      // If you're using infinite queries, also populate that cache
+      utils.row.getByTableIdInfinite.setData(
+        { tableId: realTable.id },
+        {
+          pages: [{
+            items: realTable.rows || [],
+            nextCursor: undefined
+          }],
+          pageParams: [undefined]
+        }
+      );
+    }
+
+    // Navigate to the new table
+    router.push(`/table/${realTable.id}`);
+  },
+  onError: (error, variables, context) => {
+    if (context?.previousTables) {
+      utils.table.getAllByBase.setData({ baseId }, context.previousTables);
+    }
+    setNewTableName("");
+    setShowCreateTableModal(false);
+    console.error('Failed to create table:', error);
+  },
+});
 
   // Handle table switching with loading state
   const handleTableSwitch = async (newTableId: string) => {
@@ -886,12 +914,21 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
             {columns.map((column) => (
               <div 
                 key={column.id}
-                className="border-r bg-gray-50 flex-shrink-0"
-                style={{ width: COLUMN_WIDTH }}
+                className="border-r bg-gray-50 flex-shrink-0 overflow-hidden" // FIXED: Added overflow-hidden
+                style={{ 
+                  width: COLUMN_WIDTH,
+                  maxWidth: COLUMN_WIDTH, // FIXED: Enforce strict width
+                  minWidth: COLUMN_WIDTH
+                }}
               >
-                <div className="flex items-center justify-between px-4 py-3">
-                  <span className="font-medium">{column.name}</span>
-                  <ChevronDown className="h-4 w-4 text-gray-400" />
+                <div className="flex items-center justify-between px-4 py-3 overflow-hidden"> {/* FIXED: Added overflow-hidden */}
+                  <span 
+                    className="font-medium truncate flex-1 mr-2" // FIXED: Added truncate and flex-1
+                    title={column.name} // FIXED: Show full column name on hover
+                  >
+                    {column.name}
+                  </span>
+                  <ChevronDown className="h-4 w-4 text-gray-400 flex-shrink-0" />
                 </div>
               </div>
             ))}
@@ -1080,14 +1117,35 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
                           } else {
                             content = (
                               <div 
-                                className="cursor-pointer hover:bg-gray-100 px-4 h-12 flex items-center w-full"
+                                className="cursor-pointer hover:bg-gray-100 px-4 h-12 flex items-center w-full group relative"
                                 onClick={() => {
                                   if (!isUpdating) {
                                     setEditingCell({ rowId: row.id, columnId: column.id });
                                   }
                                 }}
+                                title={value} // FIXED: Browser tooltip shows full text
                               >
-                                {searchQuery ? highlightSearchTerm(value, searchQuery) : (value || "")}
+                                <span 
+                                  className="text-sm w-full block"
+                                  style={{
+                                    overflow: 'hidden',           // FIXED: Hide overflow
+                                    textOverflow: 'ellipsis',     // FIXED: Show "..." for cut text
+                                    whiteSpace: 'nowrap',         // FIXED: Prevent text wrapping
+                                    maxWidth: '100%'              // FIXED: Stay within parent
+                                  }}
+                                >
+                                  {searchQuery ? highlightSearchTerm(value, searchQuery) : (value || "")}
+                                </span>
+                                
+                                {/* FIXED: Custom tooltip for long text - shows on hover */}
+                                {value && value.length > 25 && (
+                                  <div 
+                                    className="absolute left-0 top-12 bg-gray-900 text-white text-xs px-2 py-1 rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 z-50 max-w-xs break-words pointer-events-none"
+                                    style={{ wordWrap: 'break-word' }}
+                                  >
+                                    {value}
+                                  </div>
+                                )}
                               </div>
                             );
                           }
@@ -1102,10 +1160,12 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
                         return (
                           <div
                             key={column.id}
+                            className="border-r flex-shrink-0 relative overflow-hidden bg-white" // FIXED: Added overflow-hidden
                             style={{
-                              width: `${COLUMN_WIDTH}px`,
+                              width: COLUMN_WIDTH,
+                              maxWidth: COLUMN_WIDTH, // FIXED: Enforce strict width
+                              minWidth: COLUMN_WIDTH
                             }}
-                            className="border-r flex-shrink-0"
                           >
                             {content}
                           </div>

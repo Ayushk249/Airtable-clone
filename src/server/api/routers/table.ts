@@ -1,5 +1,7 @@
+// src/server/api/routers/table.ts
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
+import { faker } from "@faker-js/faker";
 
 import {
   createTRPCRouter,
@@ -14,11 +16,106 @@ export const tableRouter = createTRPCRouter({
       baseId: z.string(),
     }))
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.table.create({
-        data: {
-          name: input.name,
-          baseId: input.baseId,
-        },
+      // Use optimized transaction with increased timeout
+      return await ctx.db.$transaction(async (tx) => {
+        // 1. Create the table
+        const newTable = await tx.table.create({
+          data: {
+            name: input.name,
+            baseId: input.baseId,
+          },
+        });
+
+        // 2. Create columns in batch (MUCH faster than individual creates)
+        const columnsData = [
+          { name: "Name", type: "TEXT" as const, position: 0, tableId: newTable.id },
+          { name: "Age", type: "NUMBER" as const, position: 1, tableId: newTable.id },
+          { name: "Email", type: "TEXT" as const, position: 2, tableId: newTable.id },
+        ];
+        
+        await tx.column.createMany({ data: columnsData });
+        
+        // Get created columns for cell creation
+        const createdColumns = await tx.column.findMany({
+          where: { tableId: newTable.id },
+          orderBy: { position: "asc" }
+        });
+
+        // 3. Create rows in batch (MUCH faster than individual creates)
+        const rowsData = [
+          { tableId: newTable.id, position: 0 },
+          { tableId: newTable.id, position: 1 },
+          { tableId: newTable.id, position: 2 },
+        ];
+        
+        await tx.row.createMany({ data: rowsData });
+        
+        // Get created rows for cell creation
+        const createdRows = await tx.row.findMany({
+          where: { tableId: newTable.id },
+          orderBy: { position: "asc" }
+        });
+
+        // 4. Create all cells in ONE batch operation (HUGE performance gain)
+        const cellsData = [];
+        for (let rowIndex = 0; rowIndex < createdRows.length; rowIndex++) {
+          for (let colIndex = 0; colIndex < createdColumns.length; colIndex++) {
+            const row = createdRows[rowIndex];
+            const column = createdColumns[colIndex];
+            
+            let cellValue = "";
+            // Generate fake data based on column name
+            switch (column.name) {
+              case "Name":
+                cellValue = faker.person.fullName();
+                break;
+              case "Age":
+                cellValue = faker.number.int({ min: 18, max: 80 }).toString();
+                break;
+              case "Email":
+                cellValue = faker.internet.email();
+                break;
+              default:
+                // Fallback for any additional columns
+                if (column.type === "NUMBER") {
+                  cellValue = faker.number.int({ min: 1, max: 1000 }).toString();
+                } else {
+                  cellValue = faker.lorem.words({ min: 1, max: 3 });
+                }
+            }
+            
+            cellsData.push({
+              rowId: row.id,
+              columnId: column.id,
+              value: cellValue,
+            });
+          }
+        }
+        
+        // Single batch create for all 9 cells
+        await tx.cell.createMany({ data: cellsData });
+
+        // 5. Return the complete table with all its data for frontend cache
+        return await tx.table.findUnique({
+          where: { id: newTable.id },
+          include: {
+            columns: {
+              orderBy: { position: "asc" }
+            },
+            rows: {
+              include: {
+                cells: {
+                  include: {
+                    column: true,
+                  }
+                }
+              },
+              orderBy: { position: "asc" }
+            },
+          },
+        });
+      }, {
+        timeout: 10000, // 10 seconds timeout (double the default)
       });
     }),
 
@@ -170,60 +267,55 @@ export const columnRouter = createTRPCRouter({
 
 // Row Procedures
 export const rowRouter = createTRPCRouter({
-getByTableIdInfinite: protectedProcedure
-  .input(z.object({ 
-    tableId: z.string(),
-    limit: z.number().min(1).max(100).default(50),
-    cursor: z.string().optional(), // cursor is row id for pagination
-  }))
-  .query(async ({ ctx, input }) => {
-    // Verify the user owns the table
-    const table = await ctx.db.table.findFirst({
-      where: { id: input.tableId },
-      include: { base: true },
-    });
+  getByTableIdInfinite: protectedProcedure
+    .input(z.object({ 
+      tableId: z.string(),
+      limit: z.number().min(1).max(100).default(50),
+      cursor: z.string().optional(), // cursor is row id for pagination
+    }))
+    .query(async ({ ctx, input }) => {
+      // Verify the user owns the table
+      const table = await ctx.db.table.findFirst({
+        where: { id: input.tableId },
+        include: { base: true },
+      });
 
-    if (!table || table.base.userId !== ctx.session.user.id) {
-      throw new TRPCError({ code: "FORBIDDEN" });
-    }
+      if (!table || table.base.userId !== ctx.session.user.id) {
+        throw new TRPCError({ code: "FORBIDDEN" });
+      }
 
-    const rows = await ctx.db.row.findMany({
-      where: { 
-        tableId: input.tableId,
-        ...(input.cursor ? {
-          id: {
-            gt: input.cursor, // Get rows after the cursor
-          },
-        } : {}),
-      },
-      include: {
-        cells: {
-          include: {
-            column: true,
+      const rows = await ctx.db.row.findMany({
+        where: { 
+          tableId: input.tableId,
+          ...(input.cursor ? { id: { gt: input.cursor } } : {})
+        },
+        include: {
+          cells: {
+            include: {
+              column: true,
+            },
           },
         },
-      },
-      orderBy: { position: "asc" },
-      take: input.limit + 1, // Take one extra to know if there's a next page
-    });
+        orderBy: { position: "asc" },
+        take: input.limit + 1, // Take one extra to determine if there's a next page
+      });
 
-    let nextCursor: string | undefined = undefined;
-    if (rows.length > input.limit) {
-      const nextItem = rows.pop(); // Remove the extra item
-      nextCursor = nextItem!.id;
-    }
+      let nextCursor: typeof input.cursor | undefined = undefined;
+      if (rows.length > input.limit) {
+        const nextItem = rows.pop(); // Remove the extra item
+        nextCursor = nextItem!.id;
+      }
 
-    return {
-      items: rows,
-      nextCursor,
-    };
-  }),
+      return {
+        items: rows,
+        nextCursor,
+      };
+    }),
 
-  
   getByTableId: protectedProcedure
     .input(z.object({ tableId: z.string() }))
     .query(async ({ ctx, input }) => {
-      // Verify the user owns the table
+      // Verify ownership
       const table = await ctx.db.table.findFirst({
         where: { id: input.tableId },
         include: { base: true },
@@ -251,7 +343,7 @@ getByTableIdInfinite: protectedProcedure
       tableId: z.string(),
     }))
     .mutation(async ({ ctx, input }) => {
-      // Verify the user owns the table
+      // Verify ownership
       const table = await ctx.db.table.findFirst({
         where: { id: input.tableId },
         include: { base: true },
