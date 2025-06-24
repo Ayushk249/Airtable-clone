@@ -18,7 +18,6 @@ export const tableRouter = createTRPCRouter({
     .mutation(async ({ ctx, input }) => {
       // Use optimized transaction with increased timeout
       return await ctx.db.$transaction(async (tx) => {
-        // 1. Create the table
         const newTable = await tx.table.create({
           data: {
             name: input.name,
@@ -26,7 +25,7 @@ export const tableRouter = createTRPCRouter({
           },
         });
 
-        // 2. Create columns in batch (MUCH faster than individual creates)
+  
         const columnsData = [
           { name: "Name", type: "TEXT" as const, position: 0, tableId: newTable.id },
           { name: "Age", type: "NUMBER" as const, position: 1, tableId: newTable.id },
@@ -35,13 +34,13 @@ export const tableRouter = createTRPCRouter({
         
         await tx.column.createMany({ data: columnsData });
         
-        // Get created columns for cell creation
+        // created columns for cell creation
         const createdColumns = await tx.column.findMany({
           where: { tableId: newTable.id },
           orderBy: { position: "asc" }
         });
 
-        // 3. Create rows in batch (MUCH faster than individual creates)
+
         const rowsData = [
           { tableId: newTable.id, position: 0 },
           { tableId: newTable.id, position: 1 },
@@ -56,7 +55,7 @@ export const tableRouter = createTRPCRouter({
           orderBy: { position: "asc" }
         });
 
-        // 4. Create all cells in ONE batch operation (HUGE performance gain)
+      
         const cellsData = [];
         for (let rowIndex = 0; rowIndex < createdRows.length; rowIndex++) {
           for (let colIndex = 0; colIndex < createdColumns.length; colIndex++) {
@@ -91,11 +90,10 @@ export const tableRouter = createTRPCRouter({
             });
           }
         }
-        
-        // Single batch create for all 9 cells
+    
         await tx.cell.createMany({ data: cellsData });
 
-        // 5. Return the complete table with all its data for frontend cache
+        //Return the complete table with all its data for frontend cache
         return await tx.table.findUnique({
           where: { id: newTable.id },
           include: {
@@ -115,9 +113,10 @@ export const tableRouter = createTRPCRouter({
           },
         });
       }, {
-        timeout: 10000, // 10 seconds timeout (double the default)
+        timeout: 15000,
       });
     }),
+
 
   getAllByBase: protectedProcedure
     .input(z.object({
@@ -248,7 +247,7 @@ export const columnRouter = createTRPCRouter({
   delete: protectedProcedure
     .input(z.object({ id: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      // Verify ownership
+
       const column = await ctx.db.column.findFirst({
         where: { id: input.id },
         include: { table: { include: { base: true } } },
@@ -416,7 +415,7 @@ export const rowRouter = createTRPCRouter({
     }),
 });
 
-// Cell Procedures
+
 export const cellRouter = createTRPCRouter({
   update: protectedProcedure
     .input(z.object({
@@ -428,14 +427,35 @@ export const cellRouter = createTRPCRouter({
       // Verify ownership through the row
       const row = await ctx.db.row.findFirst({
         where: { id: input.rowId },
-        include: { table: { include: { base: true } } },
+        include: { 
+          table: { include: { base: true } },
+          cells: {
+            where: { columnId: input.columnId },
+            include: { column: true }
+          }
+        },
       });
 
       if (!row || row.table.base.userId !== ctx.session.user.id) {
         throw new TRPCError({ code: "FORBIDDEN" });
       }
 
-      // Update or create the cell
+      // Get the column to check its type
+      const column = await ctx.db.column.findUnique({
+        where: { id: input.columnId },
+      });
+
+      if (!column) {
+        throw new TRPCError({ 
+          code: "NOT_FOUND", 
+          message: "Column not found" 
+        });
+      }
+
+      // NEW: Validate data based on column type
+      const validatedValue = validateCellValue(input.value, column.type);
+
+      // Update or create the cell with validated value
       return ctx.db.cell.upsert({
         where: {
           rowId_columnId: {
@@ -444,13 +464,150 @@ export const cellRouter = createTRPCRouter({
           },
         },
         update: {
-          value: input.value,
+          value: validatedValue,
         },
         create: {
           rowId: input.rowId,
           columnId: input.columnId,
-          value: input.value,
+          value: validatedValue,
         },
       });
     }),
+
+  // Update multiple cells with validation
+  batchUpdate: protectedProcedure
+    .input(z.object({
+      updates: z.array(z.object({
+        rowId: z.string(),
+        columnId: z.string(),
+        value: z.string(),
+      })),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      // Verify ownership for all rows in a single query
+      const rowIds = [...new Set(input.updates.map(u => u.rowId))];
+      const rows = await ctx.db.row.findMany({
+        where: { 
+          id: { in: rowIds },
+        },
+        include: { 
+          table: { include: { base: true } }
+        },
+      });
+
+      // Check ownership for all rows
+      for (const row of rows) {
+        if (row.table.base.userId !== ctx.session.user.id) {
+          throw new TRPCError({ code: "FORBIDDEN" });
+        }
+      }
+
+      // Get all columns involved for validation
+      const columnIds = [...new Set(input.updates.map(u => u.columnId))];
+      const columns = await ctx.db.column.findMany({
+        where: { id: { in: columnIds } },
+      });
+
+      const columnMap = new Map(columns.map(col => [col.id, col]));
+
+      // Validate and prepare updates
+      const validatedUpdates = input.updates.map(update => {
+        const column = columnMap.get(update.columnId);
+        if (!column) {
+          throw new TRPCError({ 
+            code: "NOT_FOUND", 
+            message: `Column ${update.columnId} not found` 
+          });
+        }
+
+        return {
+          ...update,
+          value: validateCellValue(update.value, column.type),
+        };
+      });
+
+      // Perform batch update using transaction
+      return ctx.db.$transaction(async (tx) => {
+        const results = [];
+        
+        for (const update of validatedUpdates) {
+          const result = await tx.cell.upsert({
+            where: {
+              rowId_columnId: {
+                rowId: update.rowId,
+                columnId: update.columnId,
+              },
+            },
+            update: {
+              value: update.value,
+            },
+            create: {
+              rowId: update.rowId,
+              columnId: update.columnId,
+              value: update.value,
+            },
+          });
+          results.push(result);
+        }
+        
+        return results;
+      });
+    }),
 });
+
+// Utility function for data validation
+function validateCellValue(value: string, columnType: "TEXT" | "NUMBER"): string {
+  if (value.trim() === "") {
+    return "";
+  }
+
+  switch (columnType) {
+    case "TEXT":
+      // For TEXT columns, any string is valid
+      return value;
+      
+    case "NUMBER":
+      // For NUMBER columns, validate that it's a valid number
+      const trimmedValue = value.trim();
+      
+      // Allow negative numbers, decimals, and scientific notation
+      const numberRegex = /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+      
+      if (!numberRegex.test(trimmedValue)) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Invalid number format. Please enter a valid number (e.g., 123, -45.67, 1.2e-3)",
+        });
+      }
+
+      // Additional validation: ensure it can be parsed as a number
+      const parsedNumber = parseFloat(trimmedValue);
+      if (isNaN(parsedNumber) || !isFinite(parsedNumber)) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Invalid number format. Please enter a valid number",
+        });
+      }
+
+      // Return the trimmed value (but keep as string for storage)
+      return trimmedValue;
+      
+    default:
+      return value;
+  }
+}
+
+// Helper function to format numbers for display (optional)
+export function formatNumberValue(value: string): string {
+  if (!value || value.trim() === "") return "";
+  
+  const num = parseFloat(value);
+  if (isNaN(num)) return value;
+  
+  // Format large numbers with commas for better readability
+  if (Math.abs(num) >= 1000) {
+    return num.toLocaleString();
+  }
+  
+  return value;
+}

@@ -1,62 +1,399 @@
-// app/table/[tableId]/table-view.tsx
+// app/table/[tableId]/tableView.tsx
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
-import {
-  useReactTable,
-  getCoreRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
-  getSortedRowModel,
-  createColumnHelper,
-  flexRender,
-  type ColumnDef,
-  type SortingState,
-  type ColumnFiltersState,
-} from "@tanstack/react-table";
-import { Button } from "~/components/ui/button";
-import { Input } from "~/components/ui/input";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import { api } from "~/trpc/react";
-import { Plus, Edit2, Trash2, ChevronUp, ChevronDown, Search } from "lucide-react";
-// Simple toast replacement - you can install sonner later for better UX
-const toast = {
-  success: (message: string, options?: any) => console.log('✅', message),
-  error: (message: string) => console.error('❌', message),
-  loading: (message: string, options?: any) => console.log('⏳', message),
-};
+import { Loader2 } from "lucide-react";
 
-// Import types that match your Prisma schema
-import type { Column, Row, Cell, ColumnType, RowWithCells } from "./interface";
+// Import types
+import type { Column, RowWithCells, ColumnType } from "./interface";
+
+// Import components
+import { TableHeader } from "./components/TableHeader";
+import { Toolbar } from "./components/Toolbar";
+import { ColumnHeader } from "./components/ColumnHeader";
+import { DataGrid } from "./components/DataGrid";
+import { CreateTableModal } from "./components/CreateTableModal";
+import { CreateFieldModal } from "./components/CreateFieldModal";
 
 interface TableViewProps {
   tableId: string;
   initialData: RowWithCells[];
   initialColumns: Column[];
+  tableName: string;
+  baseName: string;
+  baseId: string;
 }
 
-export function TableView({ tableId, initialData, initialColumns }: TableViewProps) {
-  const [sorting, setSorting] = useState<SortingState>([]);
-  const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-  const [globalFilter, setGlobalFilter] = useState("");
+export function TableView({ 
+  tableId, 
+  initialData, 
+  initialColumns, 
+  tableName, 
+  baseName, 
+  baseId 
+}: TableViewProps) {
+  const router = useRouter();
   const [newColumnName, setNewColumnName] = useState("");
-  const [isAddingColumn, setIsAddingColumn] = useState(false);
+  const [newColumnType, setNewColumnType] = useState<"TEXT" | "NUMBER">("TEXT");
+  const [showCreateFieldModal, setShowCreateFieldModal] = useState(false);
   const [editingCell, setEditingCell] = useState<{rowId: string, columnId: string} | null>(null);
+  
+  // Table tab management states
+  const [showCreateTableModal, setShowCreateTableModal] = useState(false);
+  const [newTableName, setNewTableName] = useState("");
+  const [isLoadingTable, setIsLoadingTable] = useState(false);
+  
+  // Search functionality
+  const [searchQuery, setSearchQuery] = useState("");
+  
+  // Validation error states
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
   
   // Track temporary cell values for rows that haven't been saved yet
   const [tempCellValues, setTempCellValues] = useState<Record<string, Record<string, string>>>({});
-
-  // tRPC queries
-  const { data: tableData = [] } = api.row.getByTableId.useQuery(
-    { tableId },
-    { initialData }
-  );
   
-  const { data: columns = [] } = api.column.getByTableId.useQuery(
-    { tableId },
-    { initialData: initialColumns }
-  );
+  // Track pending changes to prevent server overwrites
+  const [pendingChanges, setPendingChanges] = useState<Record<string, Record<string, { value: string, timestamp: number }>>>({});
+  
+  // Track temp row to real row mapping
+  const [tempToRealMapping, setTempToRealMapping] = useState<Record<string, string>>({});
+  
+  // Track when we last made local changes
+  const [lastLocalChange, setLastLocalChange] = useState<number>(0);
+
+  // Refs for virtualization and scroll sync
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const headerScrollRef = useRef<HTMLDivElement>(null);
+
+  // Fixed column width in pixels
+  const COLUMN_WIDTH = 200;
+  const ROW_HEIGHT = 48;
 
   const utils = api.useUtils();
+
+  // Fetch all tables in this base for the tab navigation
+  const { data: allTables = [], isLoading: isTablesLoading } = api.table.getAllByBase.useQuery(
+    { baseId },
+    {
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+      staleTime: 5 * 60 * 1000,
+    }
+  );
+
+  // Synchronize horizontal scrolling between header and data
+  const syncScroll = useCallback((source: 'header' | 'data', scrollLeft: number) => {
+    if (source === 'data' && headerScrollRef.current) {
+      headerScrollRef.current.scrollLeft = scrollLeft;
+    } else if (source === 'header' && tableContainerRef.current) {
+      tableContainerRef.current.scrollLeft = scrollLeft;
+    }
+  }, []);
+
+  // Create table mutation
+  const createTableMutation = api.table.create.useMutation({
+    onMutate: async (variables) => {
+      await utils.table.getAllByBase.cancel({ baseId });
+      const previousTables = utils.table.getAllByBase.getData({ baseId });
+      
+      const optimisticTable = {
+        id: `temp-table-${Date.now()}`,
+        name: variables.name,
+        baseId: variables.baseId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      
+      utils.table.getAllByBase.setData({ baseId }, (old) => {
+        return [...(old ?? []), optimisticTable];
+      });
+      
+      setNewTableName("");
+      setShowCreateTableModal(false);
+      
+      return { previousTables, tempTableId: optimisticTable.id };
+    },
+    onSuccess: (realTable, variables, context) => {
+      utils.table.getAllByBase.setData({ baseId }, (oldTables) => {
+        if (!oldTables) return [realTable];
+        return oldTables.map(table => 
+          table.id === context?.tempTableId ? realTable : table
+        );
+      });
+
+      // Pre-populate the cache with the new table's data
+      if (realTable && 'rows' in realTable && 'columns' in realTable) {
+        utils.row.getByTableId.setData({ tableId: realTable.id }, realTable.rows || []);
+        utils.column.getByTableId.setData({ tableId: realTable.id }, realTable.columns || []);
+        
+        utils.row.getByTableIdInfinite.setData(
+          { tableId: realTable.id },
+          {
+            pages: [{
+              items: realTable.rows || [],
+              nextCursor: undefined
+            }],
+            pageParams: [undefined]
+          }
+        );
+      }
+
+      router.push(`/table/${realTable.id}`);
+    },
+    onError: (error, variables, context) => {
+      if (context?.previousTables) {
+        utils.table.getAllByBase.setData({ baseId }, context.previousTables);
+      }
+      setNewTableName("");
+      setShowCreateTableModal(false);
+      console.error('Failed to create table:', error);
+    },
+  });
+
+  // Handle table switching with loading state
+  const handleTableSwitch = async (newTableId: string) => {
+    if (newTableId === tableId) return;
+    setIsLoadingTable(true);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    router.push(`/table/${newTableId}`);
+  };
+
+  const handleCreateTable = () => {
+    if (newTableName.trim()) {
+      createTableMutation.mutate({
+        name: newTableName.trim(),
+        baseId,
+      });
+    }
+  };
+
+  // Function to highlight search terms in text
+  const highlightSearchTerm = (text: string, searchTerm: string) => {
+    if (!searchTerm.trim() || !text) return text;
+    
+    const regex = new RegExp(`(${searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    const parts = text.split(regex);
+    
+    return parts.map((part, index) => 
+      regex.test(part) ? (
+        <mark key={index} className="bg-yellow-200 text-black">
+          {part}
+        </mark>
+      ) : (
+        part
+      )
+    );
+  };
+
+  // Number validation function
+  const validateNumber = (value: string): boolean => {
+    if (value.trim() === "") return true; // Allow empty values
+    
+    // Allow negative numbers, decimals, and scientific notation
+    const numberRegex = /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+    return numberRegex.test(value.trim());
+  };
+
+  // Get validation error message
+  const getValidationError = (value: string, columnType: ColumnType): string | null => {
+    if (columnType === "NUMBER" && value.trim() !== "" && !validateNumber(value)) {
+      return "Please enter a valid number";
+    }
+    return null;
+  };
+
+  // Auto-finalize temp rows after inactivity
+  useEffect(() => {
+    const autoFinalize = setInterval(() => {
+      const now = Date.now();
+      
+      if (now - lastLocalChange > 30000) {
+        setTempToRealMapping(currentMapping => {
+          const mappingEntries = Object.entries(currentMapping);
+          if (mappingEntries.length === 0) return currentMapping;
+          
+          let updatedMapping = { ...currentMapping };
+          let hasChanges = false;
+          
+          mappingEntries.forEach(([tempRowId, realRowId]) => {
+            setTempCellValues(prev => {
+              const { [tempRowId]: removed, ...rest } = prev;
+              return rest;
+            });
+            delete updatedMapping[tempRowId];
+            hasChanges = true;
+          });
+          
+          return hasChanges ? updatedMapping : currentMapping;
+        });
+      }
+      
+      setPendingChanges(prev => {
+        const cleaned = { ...prev };
+        let hasChanges = false;
+        
+        Object.keys(cleaned).forEach(rowId => {
+          Object.keys(cleaned[rowId]).forEach(columnId => {
+            if (now - cleaned[rowId][columnId].timestamp > 30000) {
+              delete cleaned[rowId][columnId];
+              hasChanges = true;
+            }
+          });
+          
+          if (Object.keys(cleaned[rowId]).length === 0) {
+            delete cleaned[rowId];
+            hasChanges = true;
+          }
+        });
+        
+        return hasChanges ? cleaned : prev;
+      });
+    }, 15000);
+    
+    return () => clearInterval(autoFinalize);
+  }, [lastLocalChange]);
+
+  // Get the columns data
+  const { data: columns = [] } = api.column.getByTableId.useQuery(
+    { tableId },
+    { 
+      initialData: initialColumns,
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+      staleTime: 5 * 60 * 1000,
+      gcTime: 10 * 60 * 1000,
+    }
+  );
+
+  // Get table data with infinite scrolling
+  const {
+    data: infiniteRowData,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading: isRowsLoading,
+    isError: rowsError,
+  } = api.row.getByTableIdInfinite.useInfiniteQuery(
+    { 
+      tableId,
+      limit: 50,
+    },
+    {
+      getNextPageParam: (lastPage) => lastPage.nextCursor,
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+      staleTime: 5 * 60 * 1000,
+      gcTime: 10 * 60 * 1000,
+      ...(initialData.length > 0 && {
+        initialData: {
+          pages: [{ items: initialData, nextCursor: undefined }],
+          pageParams: [undefined],
+        }
+      }),
+    }
+  );
+
+  // Flatten infinite data into single array
+  const allRows = useMemo(() => {
+    if (!infiniteRowData?.pages) return [];
+    return infiniteRowData.pages.flatMap(page => page.items);
+  }, [infiniteRowData]);
+
+  // Smart data selector that preserves local changes and manages temp rows
+  const smartDataSelect = useCallback((serverData: RowWithCells[]) => {
+    if (!serverData) return [];
+    
+    const filteredServerData = serverData.filter(row => {
+      const tempRowId = Object.keys(tempToRealMapping).find(tempId => tempToRealMapping[tempId] === row.id);
+      if (tempRowId && tempCellValues[tempRowId]) {
+        return false;
+      }
+      return true;
+    });
+    
+    const tempRows: RowWithCells[] = Object.keys(tempCellValues).map(tempRowId => {
+      const realRowId = tempToRealMapping[tempRowId];
+      if (realRowId) {
+        const realRow = serverData.find(r => r.id === realRowId);
+        if (realRow) {
+          return {
+            ...realRow,
+            id: tempRowId,
+            cells: realRow.cells.map(cell => ({
+              ...cell,
+              id: `temp-cell-${tempRowId}-${cell.columnId}`,
+              rowId: tempRowId,
+              value: tempCellValues[tempRowId]?.[cell.columnId] || "",
+            }))
+          };
+        }
+      }
+      
+      return {
+        id: tempRowId,
+        tableId,
+        position: 999,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        cells: columns.map(col => ({
+          id: `temp-cell-${tempRowId}-${col.id}`,
+          rowId: tempRowId,
+          columnId: col.id,
+          value: tempCellValues[tempRowId]?.[col.id] || "",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          column: col,
+        }))
+      };
+    });
+    
+    const mergedServerData = filteredServerData.map(row => {
+      const rowPendingChanges = pendingChanges[row.id];
+      if (!rowPendingChanges) {
+        return row;
+      }
+      
+      return {
+        ...row,
+        cells: row.cells.map(cell => {
+          const pendingChange = rowPendingChanges[cell.columnId];
+          if (pendingChange) {
+            return {
+              ...cell,
+              value: pendingChange.value
+            };
+          }
+          return cell;
+        })
+      };
+    });
+    
+    return [...mergedServerData, ...tempRows].sort((a, b) => a.position - b.position);
+  }, [pendingChanges, tempCellValues, tempToRealMapping, tableId, columns]);
+
+  // Apply smart selection to protect local changes
+  const tableData = useMemo(() => smartDataSelect(allRows), [allRows, smartDataSelect]);
+
+  // Filter data based on search query
+  const filteredTableData = useMemo(() => {
+    if (!searchQuery.trim()) {
+      return tableData;
+    }
+
+    const query = searchQuery.toLowerCase().trim();
+    
+    return tableData.filter(row => {
+      return row.cells.some(cell => {
+        const cellValue = cell.value?.toLowerCase() || "";
+        return cellValue.includes(query);
+      });
+    });
+  }, [tableData, searchQuery]);
 
   // Enhanced column creation
   const createColumnMutation = api.column.create.useMutation({
@@ -79,7 +416,8 @@ export function TableView({ tableId, initialData, initialColumns }: TableViewPro
       });
 
       setNewColumnName("");
-      setIsAddingColumn(false);
+      setNewColumnType("TEXT");
+      setShowCreateFieldModal(false);
 
       return { previousColumns };
     },
@@ -90,22 +428,40 @@ export function TableView({ tableId, initialData, initialColumns }: TableViewPro
           col.id.startsWith('temp-') ? realColumn : col
         );
       });
-      void utils.row.getByTableId.invalidate({ tableId });
     },
     onError: (error, variables, context) => {
       if (context?.previousColumns) {
         utils.column.getByTableId.setData({ tableId }, context.previousColumns);
       }
       setNewColumnName("");
-      setIsAddingColumn(false);
+      setNewColumnType("TEXT");
+      setShowCreateFieldModal(false);
       console.error('Failed to create column:', error);
     },
   });
 
-  // Enhanced cell update - ONLY for real rows (not temp rows)
+  // Enhanced cell update with validation
   const updateCellMutation = api.cell.update.useMutation({
     onMutate: async ({ rowId, columnId, value }) => {
-      // This should never be called with temp rows now
+      // Clear any existing validation errors for this cell
+      const cellKey = `${rowId}-${columnId}`;
+      setValidationErrors(prev => {
+        const { [cellKey]: removed, ...rest } = prev;
+        return rest;
+      });
+
+      const linkedTempRow = Object.keys(tempToRealMapping).find(tempId => tempToRealMapping[tempId] === rowId);
+      if (linkedTempRow) {
+        setTempCellValues(prev => ({
+          ...prev,
+          [linkedTempRow]: {
+            ...prev[linkedTempRow],
+            [columnId]: value
+          }
+        }));
+        return { linkedTempRow, savedValue: value, savedColumnId: columnId };
+      }
+
       await utils.row.getByTableId.cancel({ tableId });
       const previousRows = utils.row.getByTableId.getData({ tableId });
 
@@ -129,23 +485,98 @@ export function TableView({ tableId, initialData, initialColumns }: TableViewPro
         });
       });
 
-      setEditingCell(null);
-      toast.success("Cell updated!");
-      return { previousRows };
+      return { previousRows, rowId, columnId };
+    },
+    onSuccess: (result, variables, context) => {
+      if (context?.linkedTempRow) {
+        return;
+      }
+
+      setPendingChanges(prev => {
+        const newPending = { ...prev };
+        if (newPending[variables.rowId]) {
+          delete newPending[variables.rowId][variables.columnId];
+          if (Object.keys(newPending[variables.rowId]).length === 0) {
+            delete newPending[variables.rowId];
+          }
+        }
+        return newPending;
+      });
     },
     onError: (err, variables, context) => {
+      // Show validation error if it's a validation error
+      if (err.message.includes("Invalid number")) {
+        const cellKey = `${variables.rowId}-${variables.columnId}`;
+        setValidationErrors(prev => ({
+          ...prev,
+          [cellKey]: "Please enter a valid number"
+        }));
+      }
+
+      if (context?.linkedTempRow && context?.savedColumnId) {
+        setTempCellValues(prev => {
+          const updated = { ...prev };
+          if (updated[context.linkedTempRow] && updated[context.linkedTempRow][context.savedColumnId]) {
+            delete updated[context.linkedTempRow][context.savedColumnId];
+            if (Object.keys(updated[context.linkedTempRow]).length === 0) {
+              delete updated[context.linkedTempRow];
+            }
+          }
+          return updated;
+        });
+        return;
+      }
+
       if (context?.previousRows) {
         utils.row.getByTableId.setData({ tableId }, context.previousRows);
       }
-      toast.error("Failed to update cell");
+      
+      if (context?.rowId && context?.columnId) {
+        setPendingChanges(prev => {
+          const newPending = { ...prev };
+          if (newPending[context.rowId]) {
+            delete newPending[context.rowId][context.columnId];
+            if (Object.keys(newPending[context.rowId]).length === 0) {
+              delete newPending[context.rowId];
+            }
+          }
+          return newPending;
+        });
+      }
+      
       console.error('Failed to update cell:', err);
     },
   });
 
-  // Separate function to handle cell updates (temp or real)
+  // Enhanced cell update handling with validation
   const handleCellUpdate = useCallback((rowId: string, columnId: string, value: string) => {
+    const timestamp = Date.now();
+    setLastLocalChange(timestamp);
+
+    // Find the column to check its type
+    const column = columns.find(col => col.id === columnId);
+    if (!column) return;
+
+    // Validate the value
+    const validationError = getValidationError(value, column.type);
+    const cellKey = `${rowId}-${columnId}`;
+    
+    if (validationError) {
+      setValidationErrors(prev => ({
+        ...prev,
+        [cellKey]: validationError
+      }));
+      setEditingCell(null);
+      return; // Don't save invalid values
+    }
+
+    // Clear any existing validation errors
+    setValidationErrors(prev => {
+      const { [cellKey]: removed, ...rest } = prev;
+      return rest;
+    });
+    
     if (rowId.startsWith('temp-row-')) {
-      // Handle temp row updates locally only
       setTempCellValues(prev => ({
         ...prev,
         [rowId]: {
@@ -153,312 +584,106 @@ export function TableView({ tableId, initialData, initialColumns }: TableViewPro
           [columnId]: value
         }
       }));
+      
       setEditingCell(null);
-      toast.success("Change saved locally - will sync when row is created", {
-        duration: 2000,
-      });
+      
+      const realRowId = tempToRealMapping[rowId];
+      if (realRowId && value.trim()) {
+        updateCellMutation.mutate({
+          rowId: realRowId,
+          columnId,
+          value
+        });
+      }
     } else {
-      // Handle real row updates with server call
+      setPendingChanges(prev => ({
+        ...prev,
+        [rowId]: {
+          ...prev[rowId],
+          [columnId]: { value, timestamp }
+        }
+      }));
+      
+      setEditingCell(null);
+      
       updateCellMutation.mutate({
         rowId,
         columnId,
         value
       });
     }
-  }, [updateCellMutation]);
+  }, [updateCellMutation, tempToRealMapping, columns]);
 
-  // Batch update multiple cells at once
+  // Batch update multiple cells
   const batchUpdateCells = api.cell.update.useMutation({
     onSuccess: () => {
-      toast.success("Row saved successfully!");
+      // Don't invalidate here to prevent refresh
     },
-    onError: () => {
-      toast.error("Failed to save some changes");
+    onError: (error) => {
+      console.error("Batch cell update failed:", error);
+      void utils.row.getByTableId.invalidate({ tableId });
     }
   });
 
-  // Enhanced row deletion
-  const deleteRowMutation = api.row.delete.useMutation({
-    onMutate: async ({ id }) => {
-      await utils.row.getByTableId.cancel({ tableId });
-      const previousRows = utils.row.getByTableId.getData({ tableId });
-
-      utils.row.getByTableId.setData({ tableId }, (oldRows) => {
-        if (!oldRows) return oldRows;
-        return oldRows.filter(row => row.id !== id);
-      });
-
-      // Clean up temp cell values if it was a temp row
-      if (id.startsWith('temp-row-')) {
-        setTempCellValues(prev => {
-          const { [id]: removed, ...rest } = prev;
-          return rest;
-        });
-      }
-
-      toast.success("Row deleted!");
-      return { previousRows };
-    },
-    onError: (error, variables, context) => {
-      if (context?.previousRows) {
-        utils.row.getByTableId.setData({ tableId }, context.previousRows);
-      }
-      toast.error("Failed to delete row");
-      console.error('Failed to delete row:', error);
-    },
-  });
-
-  // Enhanced row creation with batch cell updates
+  // Enhanced row creation
   const createRowMutation = api.row.create.useMutation({
     onMutate: async (variables) => {
       await utils.row.getByTableId.cancel({ tableId });
       const previousRows = utils.row.getByTableId.getData({ tableId });
 
       const tempRowId = `temp-row-${Date.now()}`;
-      const optimisticRow: RowWithCells = {
-        id: tempRowId,
-        tableId: variables.tableId,
-        position: (previousRows?.length ?? 0),
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        cells: columns.map(col => ({
-          id: `temp-cell-${tempRowId}-${col.id}`,
-          rowId: tempRowId,
-          columnId: col.id,
-          value: "",
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          column: col,
-        }))
-      };
+      
+      setTempCellValues(prev => ({
+        ...prev,
+        [tempRowId]: {}
+      }));
 
-      utils.row.getByTableId.setData({ tableId }, (old) => {
-        return [...(old ?? []), optimisticRow];
-      });
-
-      toast.success("Row created! You can start editing immediately.");
       return { previousRows, tempRowId };
     },
     onSuccess: async (realRow, variables, context) => {
       if (!realRow || !context?.tempRowId) {
-        void utils.row.getByTableId.invalidate({ tableId });
+        console.error("Missing real row or temp row ID");
         return;
       }
 
-      // Get any temp cell values that were entered
-      const tempValues = tempCellValues[context.tempRowId];
-      
-      // Replace the temporary row with the real one immediately
-      utils.row.getByTableId.setData({ tableId }, (oldRows) => {
-        if (!oldRows) return [realRow];
-        
-        return oldRows.map(row => {
-          if (row.id === context.tempRowId) {
-            // Merge temp values into the real row
-            const updatedRow = {
-              ...realRow,
-              cells: realRow.cells?.map(cell => ({
-                ...cell,
-                value: tempValues?.[cell.columnId] || cell.value || ""
-              })) || []
-            };
-            return updatedRow;
-          }
-          return row;
-        });
-      });
+      setTempToRealMapping(prev => ({
+        ...prev,
+        [context.tempRowId]: realRow.id
+      }));
 
-      // Clean up temp cell values
-      setTempCellValues(prev => {
-        const { [context.tempRowId]: removed, ...rest } = prev;
-        return rest;
-      });
-
-      // If there were any temp values, batch update them
-      if (tempValues && Object.keys(tempValues).length > 0) {
-        toast.loading("Saving your changes...", { id: "batch-update" });
-        
-        try {
-          // Save all the temp cell values to the real row
-          for (const [columnId, value] of Object.entries(tempValues)) {
-            if (value.trim()) { // Only save non-empty values
-              await batchUpdateCells.mutateAsync({
-                rowId: realRow.id,
-                columnId,
-                value
-              });
+      const saveTempValues = async () => {
+        const currentTempValues = tempCellValues[context.tempRowId];
+        if (currentTempValues && Object.keys(currentTempValues).length > 0) {
+          for (const [columnId, value] of Object.entries(currentTempValues)) {
+            if (value.trim()) {
+              try {
+                await batchUpdateCells.mutateAsync({
+                  rowId: realRow.id,
+                  columnId,
+                  value
+                });
+              } catch (error) {
+                console.error(`Failed to save cell ${columnId}:`, error);
+              }
             }
           }
-          toast.success("All changes saved!", { id: "batch-update" });
-        } catch (error) {
-          toast.error("Some changes couldn't be saved", { id: "batch-update" });
-          console.error("Batch update failed:", error);
         }
-      }
+      };
+      
+      saveTempValues();
     },
     onError: (error, variables, context) => {
-      if (context?.previousRows) {
-        utils.row.getByTableId.setData({ tableId }, context.previousRows);
-      }
       if (context?.tempRowId) {
-        setTempCellValues(prev => {
-          const { [context.tempRowId]: removed, ...rest } = prev;
-          return rest;
-        });
+        console.error(`Failed to create real row for temp row ${context.tempRowId}:`, error);
       }
-      toast.error("Failed to create row");
-      console.error('Failed to create row:', error);
     },
   });
 
-  // Create column definitions
-  const columnHelper = createColumnHelper<RowWithCells>();
-  
-  const tableColumns = useMemo<ColumnDef<RowWithCells>[]>(() => {
-    const dynamicColumns = columns
-      .sort((a, b) => a.position - b.position)
-      .map((col) =>
-        columnHelper.accessor(
-          (row) => {
-            const isTemporaryRow = row.id.startsWith('temp-row-');
-            
-            // For temporary rows, check our local state first
-            if (isTemporaryRow && tempCellValues[row.id]?.[col.id] !== undefined) {
-              return tempCellValues[row.id][col.id];
-            }
-            
-            // For real rows or no temp value, use the cell value
-            const cell = row.cells.find(c => c.columnId === col.id);
-            return cell?.value || "";
-          },
-          {
-            id: col.id,
-            header: ({ column }) => (
-              <div className="flex items-center gap-2">
-                <span>{col.name}</span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-                >
-                  {column.getIsSorted() === "asc" ? (
-                    <ChevronUp className="h-4 w-4" />
-                  ) : column.getIsSorted() === "desc" ? (
-                    <ChevronDown className="h-4 w-4" />
-                  ) : (
-                    <div className="h-4 w-4" />
-                  )}
-                </Button>
-              </div>
-            ),
-            cell: ({ row, getValue }) => {
-              const isEditing = editingCell?.rowId === row.original.id && editingCell?.columnId === col.id;
-              const value = getValue() as string;
-              const isUpdating = updateCellMutation.isPending && 
-                                updateCellMutation.variables?.rowId === row.original.id && 
-                                updateCellMutation.variables?.columnId === col.id;
-              
-              const isTemporaryRow = row.original.id.startsWith('temp-row-');
-              
-              if (isEditing) {
-                return (
-                  <Input
-                    defaultValue={value}
-                    autoFocus
-                    className="h-8"
-                    disabled={isUpdating}
-                    onBlur={(e) => {
-                      const newValue = e.target.value;
-                      if (newValue !== value) {
-                        handleCellUpdate(row.original.id, col.id, newValue);
-                      } else {
-                        setEditingCell(null);
-                      }
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        const newValue = e.currentTarget.value;
-                        if (newValue !== value) {
-                          handleCellUpdate(row.original.id, col.id, newValue);
-                        } else {
-                          setEditingCell(null);
-                        }
-                      } else if (e.key === "Escape") {
-                        setEditingCell(null);
-                      }
-                    }}
-                  />
-                );
-              }
-              
-              return (
-                <div 
-                  className={`cursor-pointer hover:bg-gray-100 p-1 rounded min-h-[32px] flex items-center ${
-                    isUpdating ? "opacity-75" : ""
-                  } ${isTemporaryRow ? "border-l-2 border-blue-400" : ""}`}
-                  onClick={() => {
-                    if (!isUpdating) {
-                      setEditingCell({ rowId: row.original.id, columnId: col.id });
-                    }
-                  }}
-                  title={isTemporaryRow ? "New row - changes will be saved automatically" : undefined}
-                >
-                  {value || <span className="text-gray-400">Empty</span>}
-                </div>
-              );
-            },
-          }
-        )
-      );
-
-    const actionsColumn = columnHelper.display({
-      id: "actions",
-      header: "Actions",
-      cell: ({ row }) => (
-        <Button
-          variant="destructive"
-          size="sm"
-          onClick={() => {
-            if (window.confirm("Are you sure you want to delete this row?")) {
-              deleteRowMutation.mutate({ id: row.original.id });
-            }
-          }}
-          disabled={deleteRowMutation.isPending}
-        >
-          {deleteRowMutation.isPending && deleteRowMutation.variables?.id === row.original.id ? (
-            <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-          ) : (
-            <Trash2 className="h-4 w-4" />
-          )}
-        </Button>
-      ),
-    });
-
-    return [...dynamicColumns, actionsColumn];
-  }, [columns, editingCell, updateCellMutation, deleteRowMutation, columnHelper, tempCellValues, handleCellUpdate]);
-
-  const table = useReactTable({
-    data: tableData,
-    columns: tableColumns,
-    getCoreRowModel: getCoreRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    onSortingChange: setSorting,
-    onColumnFiltersChange: setColumnFilters,
-    onGlobalFilterChange: setGlobalFilter,
-    state: {
-      sorting,
-      columnFilters,
-      globalFilter,
-    },
-  });
-
-  const handleAddColumn = () => {
+  const handleCreateField = () => {
     if (newColumnName.trim()) {
       createColumnMutation.mutate({
         name: newColumnName.trim(),
-        type: "TEXT",
+        type: newColumnType,
         tableId,
       });
     }
@@ -471,167 +696,119 @@ export function TableView({ tableId, initialData, initialColumns }: TableViewPro
     });
   };
 
+  // Check if any mutations are pending for loading state
+  const isLoading = createColumnMutation.isPending || createRowMutation.isPending;
+
+  // Show loading screen when switching tables
+  if (isLoadingTable) {
+    return (
+      <div className="h-full bg-white flex flex-col overflow-hidden">
+        <TableHeader
+          allTables={allTables}
+          isTablesLoading={isTablesLoading}
+          currentTableId={tableId}
+          isLoadingTable={isLoadingTable}
+          onTableSwitch={handleTableSwitch}
+          onCreateTableClick={() => setShowCreateTableModal(true)}
+          isCreatingTable={createTableMutation.isPending}
+        />
+        <div className="flex-1 bg-white flex items-center justify-center">
+          <div className="text-center">
+            <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4 text-purple-600" />
+            <p className="text-gray-600 text-lg font-medium">Loading table...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="space-y-4">
-      {/* Controls */}
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <Input
-            placeholder="Search all columns..."
-            value={globalFilter ?? ""}
-            onChange={(e) => setGlobalFilter(e.target.value)}
-            className="max-w-sm"
-          />
-        </div>
-        
-        <div className="flex items-center gap-2">
-          {isAddingColumn ? (
-            <div className="flex items-center gap-2">
-              <Input
-                placeholder="Column name"
-                value={newColumnName}
-                onChange={(e) => setNewColumnName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleAddColumn();
-                  if (e.key === "Escape") {
-                    setIsAddingColumn(false);
-                    setNewColumnName("");
-                  }
-                }}
-                autoFocus
-              />
-              <Button 
-                onClick={handleAddColumn} 
-                disabled={!newColumnName.trim() || createColumnMutation.isPending}
-              >
-                {createColumnMutation.isPending ? "Adding..." : "Add"}
-              </Button>
-              <Button 
-                variant="outline" 
-                onClick={() => {
-                  setIsAddingColumn(false);
-                  setNewColumnName("");
-                }}
-              >
-                Cancel
-              </Button>
-            </div>
-          ) : (
-            <Button onClick={() => setIsAddingColumn(true)}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Column
-            </Button>
-          )}
-          
-          <Button 
-            onClick={handleAddRow}
-            disabled={createRowMutation.isPending}
-          >
-            {createRowMutation.isPending ? (
-              <>
-                <Plus className="h-4 w-4 mr-2 animate-pulse" />
-                Creating...
-              </>
-            ) : (
-              <>
-                <Plus className="h-4 w-4 mr-2" />
-                Add Row
-              </>
-            )}
-          </Button>
-        </div>
+    <div className="h-full bg-white flex flex-col overflow-hidden">
+      {/* Header with Tabs - Fixed */}
+      <TableHeader
+        allTables={allTables}
+        isTablesLoading={isTablesLoading}
+        currentTableId={tableId}
+        isLoadingTable={isLoadingTable}
+        onTableSwitch={handleTableSwitch}
+        onCreateTableClick={() => setShowCreateTableModal(true)}
+        isCreatingTable={createTableMutation.isPending}
+      />
+
+      {/* Toolbar - Fixed */}
+      <Toolbar
+        searchQuery={searchQuery}
+        onSearchChange={setSearchQuery}
+        isLoading={isLoading}
+        createColumnIsPending={createColumnMutation.isPending}
+        filteredDataLength={filteredTableData.length}
+        totalDataLength={tableData.length}
+      />
+
+      {/* Fixed Column Headers */}
+      <ColumnHeader
+        ref={headerScrollRef}
+        columns={columns}
+        columnWidth={COLUMN_WIDTH}
+        onAddColumn={() => setShowCreateFieldModal(true)}
+        onScroll={syncScroll}
+      />
+
+      {/* Scrollable Table Body */}
+      <div className="flex-1 flex min-h-0 overflow-hidden">
+        <DataGrid
+          ref={tableContainerRef}
+          tableData={tableData}
+          filteredTableData={filteredTableData}
+          columns={columns}
+          columnWidth={COLUMN_WIDTH}
+          rowHeight={ROW_HEIGHT}
+          editingCell={editingCell}
+          tempCellValues={tempCellValues}
+          pendingChanges={pendingChanges}
+          validationErrors={validationErrors}
+          searchQuery={searchQuery}
+          hasNextPage={hasNextPage}
+          isFetchingNextPage={isFetchingNextPage}
+          isRowsLoading={isRowsLoading}
+          rowsError={rowsError}
+          infiniteRowData={infiniteRowData}
+          updateCellMutation={updateCellMutation}
+          createRowMutation={createRowMutation}
+          onCellEdit={(rowId, columnId) => setEditingCell({ rowId, columnId })}
+          onCellUpdate={handleCellUpdate}
+          onAddRow={handleAddRow}
+          onScroll={syncScroll}
+          onFetchNextPage={() => void fetchNextPage()}
+          onSearchClear={() => setSearchQuery("")}
+          highlightSearchTerm={highlightSearchTerm}
+          getValidationError={getValidationError}
+          setValidationErrors={setValidationErrors}
+          setEditingCell={setEditingCell}
+        />
       </div>
 
-      {/* Table */}
-      <div className="border rounded-md">
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              {table.getHeaderGroups().map((headerGroup) => (
-                <tr key={headerGroup.id} className="border-b bg-gray-50">
-                  {headerGroup.headers.map((header) => (
-                    <th
-                      key={header.id}
-                      className="px-4 py-3 text-left font-medium text-gray-900"
-                    >
-                      {header.isPlaceholder
-                        ? null
-                        : flexRender(header.column.columnDef.header, header.getContext())}
-                    </th>
-                  ))}
-                </tr>
-              ))}
-            </thead>
-            <tbody>
-              {table.getRowModel().rows.length === 0 ? (
-                <tr>
-                  <td 
-                    colSpan={tableColumns.length} 
-                    className="text-center py-8 text-gray-500"
-                  >
-                    No rows yet. Click "Add Row" to create your first row.
-                  </td>
-                </tr>
-              ) : (
-                table.getRowModel().rows.map((row) => {
-                  const isTemporaryRow = row.original.id.startsWith('temp-row-');
-                  return (
-                    <tr 
-                      key={row.id} 
-                      className={`border-b hover:bg-gray-50 ${
-                        isTemporaryRow ? "bg-blue-50/20" : ""
-                      }`}
-                    >
-                      {row.getVisibleCells().map((cell) => (
-                        <td key={cell.id} className="px-4 py-3">
-                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                        </td>
-                      ))}
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      {/* Create Field Modal */}
+      <CreateFieldModal
+        isOpen={showCreateFieldModal}
+        onClose={() => setShowCreateFieldModal(false)}
+        onSubmit={handleCreateField}
+        isLoading={createColumnMutation.isPending}
+        newColumnName={newColumnName}
+        setNewColumnName={setNewColumnName}
+        newColumnType={newColumnType}
+        setNewColumnType={setNewColumnType}
+      />
 
-      {/* Pagination */}
-      <div className="flex items-center justify-between">
-        <div className="text-sm text-gray-500">
-          {table.getFilteredRowModel().rows.length === 0 ? (
-            "No rows to display"
-          ) : (
-            <>
-              Showing {table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to{" "}
-              {Math.min(
-                (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
-                table.getFilteredRowModel().rows.length
-              )}{" "}
-              of {table.getFilteredRowModel().rows.length} rows
-            </>
-          )}
-        </div>
-        
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => table.previousPage()}
-            disabled={!table.getCanPreviousPage()}
-          >
-            Previous
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => table.nextPage()}
-            disabled={!table.getCanNextPage()}
-          >
-            Next
-          </Button>
-        </div>
-      </div>
+      {/* Create Table Modal */}
+      <CreateTableModal
+        isOpen={showCreateTableModal}
+        onClose={() => setShowCreateTableModal(false)}
+        onSubmit={handleCreateTable}
+        isLoading={createTableMutation.isPending}
+        newTableName={newTableName}
+        setNewTableName={setNewTableName}
+      />
     </div>
   );
 }

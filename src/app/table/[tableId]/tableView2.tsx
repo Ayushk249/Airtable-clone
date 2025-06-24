@@ -1,4 +1,4 @@
-// app/table/[tableId]/tableView.tsx
+// app/table/[tableId]/tableView2.tsx
 "use client";
 
 import { useState, useMemo, useCallback, useEffect, useRef } from "react";
@@ -11,7 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/components/ui/select";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "~/components/ui/dropdown-menu";
 import { api } from "~/trpc/react";
-import { Plus, ChevronDown, Grid3X3, EyeOff, ArrowUpDown, List, Loader2, Search, X } from "lucide-react";
+import { Plus, ChevronDown, Grid3X3, EyeOff, ArrowUpDown, List, Loader2, Search, X, AlertCircle } from "lucide-react";
 
 // Import types that match your Prisma schema
 import type { Column, Row, Cell, ColumnType, RowWithCells } from "./interface";
@@ -39,6 +39,9 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   
   // Search functionality
   const [searchQuery, setSearchQuery] = useState("");
+  
+  // NEW: Validation error states
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
   
   // Track temporary cell values for rows that haven't been saved yet
   const [tempCellValues, setTempCellValues] = useState<Record<string, Record<string, string>>>({});
@@ -83,74 +86,64 @@ export function TableView({ tableId, initialData, initialColumns, tableName, bas
   }, []);
 
   // Create table mutation
-  // Update for your tableView component (inside the createTableMutation)
-// This replaces the existing createTableMutation in your tableView.tsx
-
-const createTableMutation = api.table.create.useMutation({
-  onMutate: async (variables) => {
-    await utils.table.getAllByBase.cancel({ baseId });
-    const previousTables = utils.table.getAllByBase.getData({ baseId });
-    
-    const optimisticTable = {
-      id: `temp-table-${Date.now()}`,
-      name: variables.name,
-      baseId: variables.baseId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-    
-    utils.table.getAllByBase.setData({ baseId }, (old) => {
-      return [...(old ?? []), optimisticTable];
-    });
-    
-    setNewTableName("");
-    setShowCreateTableModal(false);
-    
-    return { previousTables, tempTableId: optimisticTable.id };
-  },
-  onSuccess: (realTable, variables, context) => {
-    // Update the tables list
-    utils.table.getAllByBase.setData({ baseId }, (oldTables) => {
-      if (!oldTables) return [realTable];
-      return oldTables.map(table => 
-        table.id === context?.tempTableId ? realTable : table
-      );
-    });
-
-    // Pre-populate the cache with the new table's data
-    // This ensures that when we navigate to the new table, the data is already available
-    if (realTable && 'rows' in realTable && 'columns' in realTable) {
-      // Set the row data
-      utils.row.getByTableId.setData({ tableId: realTable.id }, realTable.rows || []);
+  const createTableMutation = api.table.create.useMutation({
+    onMutate: async (variables) => {
+      await utils.table.getAllByBase.cancel({ baseId });
+      const previousTables = utils.table.getAllByBase.getData({ baseId });
       
-      // Set the column data
-      utils.column.getByTableId.setData({ tableId: realTable.id }, realTable.columns || []);
+      const optimisticTable = {
+        id: `temp-table-${Date.now()}`,
+        name: variables.name,
+        baseId: variables.baseId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
       
-      // If you're using infinite queries, also populate that cache
-      utils.row.getByTableIdInfinite.setData(
-        { tableId: realTable.id },
-        {
-          pages: [{
-            items: realTable.rows || [],
-            nextCursor: undefined
-          }],
-          pageParams: [undefined]
-        }
-      );
-    }
+      utils.table.getAllByBase.setData({ baseId }, (old) => {
+        return [...(old ?? []), optimisticTable];
+      });
+      
+      setNewTableName("");
+      setShowCreateTableModal(false);
+      
+      return { previousTables, tempTableId: optimisticTable.id };
+    },
+    onSuccess: (realTable, variables, context) => {
+      utils.table.getAllByBase.setData({ baseId }, (oldTables) => {
+        if (!oldTables) return [realTable];
+        return oldTables.map(table => 
+          table.id === context?.tempTableId ? realTable : table
+        );
+      });
 
-    // Navigate to the new table
-    router.push(`/table/${realTable.id}`);
-  },
-  onError: (error, variables, context) => {
-    if (context?.previousTables) {
-      utils.table.getAllByBase.setData({ baseId }, context.previousTables);
-    }
-    setNewTableName("");
-    setShowCreateTableModal(false);
-    console.error('Failed to create table:', error);
-  },
-});
+      // Pre-populate the cache with the new table's data
+      if (realTable && 'rows' in realTable && 'columns' in realTable) {
+        utils.row.getByTableId.setData({ tableId: realTable.id }, realTable.rows || []);
+        utils.column.getByTableId.setData({ tableId: realTable.id }, realTable.columns || []);
+        
+        utils.row.getByTableIdInfinite.setData(
+          { tableId: realTable.id },
+          {
+            pages: [{
+              items: realTable.rows || [],
+              nextCursor: undefined
+            }],
+            pageParams: [undefined]
+          }
+        );
+      }
+
+      router.push(`/table/${realTable.id}`);
+    },
+    onError: (error, variables, context) => {
+      if (context?.previousTables) {
+        utils.table.getAllByBase.setData({ baseId }, context.previousTables);
+      }
+      setNewTableName("");
+      setShowCreateTableModal(false);
+      console.error('Failed to create table:', error);
+    },
+  });
 
   // Handle table switching with loading state
   const handleTableSwitch = async (newTableId: string) => {
@@ -185,6 +178,23 @@ const createTableMutation = api.table.create.useMutation({
         part
       )
     );
+  };
+
+  // NEW: Number validation function
+  const validateNumber = (value: string): boolean => {
+    if (value.trim() === "") return true; // Allow empty values
+    
+    // Allow negative numbers, decimals, and scientific notation
+    const numberRegex = /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+    return numberRegex.test(value.trim());
+  };
+
+  // NEW: Get validation error message
+  const getValidationError = (value: string, columnType: ColumnType): string | null => {
+    if (columnType === "NUMBER" && value.trim() !== "" && !validateNumber(value)) {
+      return "Please enter a valid number";
+    }
+    return null;
   };
 
   // Auto-finalize temp rows after inactivity
@@ -370,7 +380,6 @@ const createTableMutation = api.table.create.useMutation({
     const query = searchQuery.toLowerCase().trim();
     
     return tableData.filter(row => {
-      // Search across all cells in the row
       return row.cells.some(cell => {
         const cellValue = cell.value?.toLowerCase() || "";
         return cellValue.includes(query);
@@ -452,20 +461,16 @@ const createTableMutation = api.table.create.useMutation({
     },
   });
 
-  // Batch update multiple cells
-  const batchUpdateCells = api.cell.update.useMutation({
-    onSuccess: () => {
-      // Don't invalidate here to prevent refresh
-    },
-    onError: (error) => {
-      console.error("Batch cell update failed:", error);
-      void utils.row.getByTableId.invalidate({ tableId });
-    }
-  });
-
-  // Enhanced cell update with temp row synchronization
+  // Enhanced cell update with validation
   const updateCellMutation = api.cell.update.useMutation({
     onMutate: async ({ rowId, columnId, value }) => {
+      // Clear any existing validation errors for this cell
+      const cellKey = `${rowId}-${columnId}`;
+      setValidationErrors(prev => {
+        const { [cellKey]: removed, ...rest } = prev;
+        return rest;
+      });
+
       const linkedTempRow = Object.keys(tempToRealMapping).find(tempId => tempToRealMapping[tempId] === rowId);
       if (linkedTempRow) {
         setTempCellValues(prev => ({
@@ -520,6 +525,15 @@ const createTableMutation = api.table.create.useMutation({
       });
     },
     onError: (err, variables, context) => {
+      // Show validation error if it's a validation error
+      if (err.message.includes("Invalid number")) {
+        const cellKey = `${variables.rowId}-${variables.columnId}`;
+        setValidationErrors(prev => ({
+          ...prev,
+          [cellKey]: "Please enter a valid number"
+        }));
+      }
+
       if (context?.linkedTempRow && context?.savedColumnId) {
         setTempCellValues(prev => {
           const updated = { ...prev };
@@ -555,10 +569,33 @@ const createTableMutation = api.table.create.useMutation({
     },
   });
 
-  // Enhanced cell update handling
+  // Enhanced cell update handling with validation
   const handleCellUpdate = useCallback((rowId: string, columnId: string, value: string) => {
     const timestamp = Date.now();
     setLastLocalChange(timestamp);
+
+    // Find the column to check its type
+    const column = columns.find(col => col.id === columnId);
+    if (!column) return;
+
+    // Validate the value
+    const validationError = getValidationError(value, column.type);
+    const cellKey = `${rowId}-${columnId}`;
+    
+    if (validationError) {
+      setValidationErrors(prev => ({
+        ...prev,
+        [cellKey]: validationError
+      }));
+      setEditingCell(null);
+      return; // Don't save invalid values
+    }
+
+    // Clear any existing validation errors
+    setValidationErrors(prev => {
+      const { [cellKey]: removed, ...rest } = prev;
+      return rest;
+    });
     
     if (rowId.startsWith('temp-row-')) {
       setTempCellValues(prev => ({
@@ -596,7 +633,18 @@ const createTableMutation = api.table.create.useMutation({
         value
       });
     }
-  }, [updateCellMutation, tempToRealMapping]);
+  }, [updateCellMutation, tempToRealMapping, columns]);
+
+  // Batch update multiple cells
+  const batchUpdateCells = api.cell.update.useMutation({
+    onSuccess: () => {
+      // Don't invalidate here to prevent refresh
+    },
+    onError: (error) => {
+      console.error("Batch cell update failed:", error);
+      void utils.row.getByTableId.invalidate({ tableId });
+    }
+  });
 
   // Enhanced row deletion
   const deleteRowMutation = api.row.delete.useMutation({
@@ -769,7 +817,6 @@ const createTableMutation = api.table.create.useMutation({
           <div className="text-center">
             <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4 text-purple-600" />
             <p className="text-gray-600 text-lg font-medium">Loading table...</p>
-          
           </div>
         </div>
       </div>
@@ -914,20 +961,28 @@ const createTableMutation = api.table.create.useMutation({
             {columns.map((column) => (
               <div 
                 key={column.id}
-                className="border-r bg-gray-50 flex-shrink-0 overflow-hidden" // FIXED: Added overflow-hidden
+                className="border-r bg-gray-50 flex-shrink-0 overflow-hidden"
                 style={{ 
                   width: COLUMN_WIDTH,
-                  maxWidth: COLUMN_WIDTH, // FIXED: Enforce strict width
+                  maxWidth: COLUMN_WIDTH,
                   minWidth: COLUMN_WIDTH
                 }}
               >
-                <div className="flex items-center justify-between px-4 py-3 overflow-hidden"> {/* FIXED: Added overflow-hidden */}
-                  <span 
-                    className="font-medium truncate flex-1 mr-2" // FIXED: Added truncate and flex-1
-                    title={column.name} // FIXED: Show full column name on hover
-                  >
-                    {column.name}
-                  </span>
+                <div className="flex items-center justify-between px-4 py-3 overflow-hidden">
+                  <div className="flex items-center flex-1 mr-2">
+                    <span 
+                      className="font-medium truncate"
+                      title={column.name}
+                    >
+                      {column.name}
+                    </span>
+                    {/* NEW: Show column type indicator */}
+                    <span className={`ml-2 text-xs px-1 py-0.5 rounded ${
+                      column.type === 'NUMBER' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'
+                    }`}>
+                      {column.type === 'NUMBER' ? '123' : 'Aa'}
+                    </span>
+                  </div>
                   <ChevronDown className="h-4 w-4 text-gray-400 flex-shrink-0" />
                 </div>
               </div>
@@ -1062,7 +1117,7 @@ const createTableMutation = api.table.create.useMutation({
                         )}
                       </div>
 
-                      {columns.map((column, columnIndex) => {
+                      {columns.map((column) => {
                         let content: React.ReactNode = null;
 
                         if (isAddRowButton) {
@@ -1085,65 +1140,116 @@ const createTableMutation = api.table.create.useMutation({
                                             updateCellMutation.variables?.rowId === row.id && 
                                             updateCellMutation.variables?.columnId === column.id;
 
+                          // NEW: Check for validation errors
+                          const cellKey = `${row.id}-${column.id}`;
+                          const hasValidationError = validationErrors[cellKey];
+
                           if (isEditing) {
                             content = (
-                              <Input
-                                defaultValue={value}
-                                autoFocus
-                                className="border-none rounded-none focus:ring-0 focus:border-blue-500 px-4 h-12 w-full"
-                                disabled={isUpdating}
-                                onBlur={(e) => {
-                                  const newValue = e.target.value;
-                                  if (newValue !== value) {
-                                    handleCellUpdate(row.id, column.id, newValue);
-                                  } else {
-                                    setEditingCell(null);
-                                  }
-                                }}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") {
-                                    const newValue = e.currentTarget.value;
+                              <div className="relative">
+                                <Input
+                                  defaultValue={value}
+                                  autoFocus
+                                  type={column.type === "NUMBER" ? "text" : "text"} // Use text for better control
+                                  className={`border-none rounded-none focus:ring-0 focus:border-blue-500 px-4 h-12 w-full ${
+                                    hasValidationError ? 'border-red-500 focus:border-red-500' : ''
+                                  }`}
+                                  disabled={isUpdating}
+                                  // NEW: Real-time validation for NUMBER columns
+                                  onChange={(e) => {
+                                    if (column.type === "NUMBER") {
+                                      const newValue = e.target.value;
+                                      const error = getValidationError(newValue, column.type);
+                                      if (error) {
+                                        setValidationErrors(prev => ({
+                                          ...prev,
+                                          [cellKey]: error
+                                        }));
+                                      } else {
+                                        setValidationErrors(prev => {
+                                          const { [cellKey]: removed, ...rest } = prev;
+                                          return rest;
+                                        });
+                                      }
+                                    }
+                                  }}
+                                  onBlur={(e) => {
+                                    const newValue = e.target.value;
                                     if (newValue !== value) {
                                       handleCellUpdate(row.id, column.id, newValue);
                                     } else {
                                       setEditingCell(null);
                                     }
-                                  } else if (e.key === "Escape") {
-                                    setEditingCell(null);
-                                  }
-                                }}
-                              />
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      const newValue = e.currentTarget.value;
+                                      if (newValue !== value) {
+                                        handleCellUpdate(row.id, column.id, newValue);
+                                      } else {
+                                        setEditingCell(null);
+                                      }
+                                    } else if (e.key === "Escape") {
+                                      setEditingCell(null);
+                                      // Clear validation errors on escape
+                                      setValidationErrors(prev => {
+                                        const { [cellKey]: removed, ...rest } = prev;
+                                        return rest;
+                                      });
+                                    }
+                                  }}
+                                />
+                              </div>
                             );
                           } else {
                             content = (
                               <div 
-                                className="cursor-pointer hover:bg-gray-100 px-4 h-12 flex items-center w-full group relative"
+                                className={`cursor-pointer hover:bg-gray-100 px-4 h-12 flex items-center w-full group relative ${
+                                  hasValidationError ? 'bg-red-50 border-l-2 border-red-500' : ''
+                                }`}
                                 onClick={() => {
                                   if (!isUpdating) {
                                     setEditingCell({ rowId: row.id, columnId: column.id });
                                   }
                                 }}
-                                title={value} // FIXED: Browser tooltip shows full text
+                                title={hasValidationError ? `Error: ${hasValidationError}` : value}
                               >
                                 <span 
-                                  className="text-sm w-full block"
+                                  className={`text-sm w-full block ${hasValidationError ? 'text-red-600' : ''}`}
                                   style={{
-                                    overflow: 'hidden',           // FIXED: Hide overflow
-                                    textOverflow: 'ellipsis',     // FIXED: Show "..." for cut text
-                                    whiteSpace: 'nowrap',         // FIXED: Prevent text wrapping
-                                    maxWidth: '100%'              // FIXED: Stay within parent
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                    maxWidth: '100%'
                                   }}
                                 >
-                                  {searchQuery ? highlightSearchTerm(value, searchQuery) : (value || "")}
+                                  {hasValidationError ? (
+                                    <div className="flex items-center">
+                                      <AlertCircle className="h-3 w-3 mr-1 text-red-500" />
+                                      <span className="text-red-600">{value}</span>
+                                    </div>
+                                  ) : (
+                                    searchQuery ? highlightSearchTerm(value, searchQuery) : (value || "")
+                                  )}
                                 </span>
-                                
-                                {/* FIXED: Custom tooltip for long text - shows on hover */}
-                                {value && value.length > 25 && (
+
+                                {/* Custom tooltip for long text */}
+                                {value && value.length > 25 && !hasValidationError && (
                                   <div 
                                     className="absolute left-0 top-12 bg-gray-900 text-white text-xs px-2 py-1 rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 z-50 max-w-xs break-words pointer-events-none"
                                     style={{ wordWrap: 'break-word' }}
                                   >
                                     {value}
+                                  </div>
+                                )}
+
+                                {/* Validation error tooltip */}
+                                {hasValidationError && (
+                                  <div 
+                                    className="absolute left-0 top-12 bg-red-600 text-white text-xs px-2 py-1 rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 z-50 max-w-xs break-words pointer-events-none"
+                                    style={{ wordWrap: 'break-word' }}
+                                  >
+                                    {hasValidationError}
                                   </div>
                                 )}
                               </div>
@@ -1160,10 +1266,10 @@ const createTableMutation = api.table.create.useMutation({
                         return (
                           <div
                             key={column.id}
-                            className="border-r flex-shrink-0 relative overflow-hidden bg-white" // FIXED: Added overflow-hidden
+                            className="border-r flex-shrink-0 relative overflow-hidden bg-white"
                             style={{
                               width: COLUMN_WIDTH,
-                              maxWidth: COLUMN_WIDTH, // FIXED: Enforce strict width
+                              maxWidth: COLUMN_WIDTH,
                               minWidth: COLUMN_WIDTH
                             }}
                           >
@@ -1204,10 +1310,26 @@ const createTableMutation = api.table.create.useMutation({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="TEXT">Text</SelectItem>
-                  <SelectItem value="NUMBER">Number</SelectItem>
+                  <SelectItem value="TEXT">
+                    <div className="flex items-center">
+                      <span className="mr-2">📝</span>
+                      Text
+                    </div>
+                  </SelectItem>
+                  <SelectItem value="NUMBER">
+                    <div className="flex items-center">
+                      <span className="mr-2">🔢</span>
+                      Number
+                    </div>
+                  </SelectItem>
                 </SelectContent>
               </Select>
+              <p className="text-xs text-gray-500 mt-1">
+                {newColumnType === "NUMBER" 
+                  ? "Only numeric values will be accepted (integers and decimals)"
+                  : "Accepts any text input"
+                }
+              </p>
             </div>
           </div>
           <DialogFooter>

@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { auth } from "~/server/auth";
 import { api } from "~/trpc/server";
 import { Header } from "~/app/_components/Header";
-import { TableView } from "./tableView2";
+import { TableView } from "./tableView";
 
 interface PageProps {
   params: {
